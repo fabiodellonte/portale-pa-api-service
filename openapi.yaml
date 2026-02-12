@@ -1,0 +1,48 @@
+openapi: 3.0.3
+info:
+  title: Portale PA API Service
+  version: 0.1.0
+servers:
+  - url: http://localhost:8080
+paths:
+  /health:
+    get:
+      summary: Healthcheck
+      responses:
+        '200':
+          description: ok
+  /v1/tenants:
+    get:
+      summary: Lista tenant
+      responses:
+        '200': { description: ok }
+    post:
+      summary: Crea tenant
+      requestBody:
+        required: true
+      responses:
+        '201': { description: created }
+  /v1/pratiche:
+    get:
+      summary: Lista pratiche
+      parameters:
+        - in: query
+          name: tenant_id
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { description: ok }
+    post:
+      summary: Crea pratica
+      requestBody:
+        required: true
+      responses:
+        '201': { description: created }
+  /v1/audit:
+    get:
+      summary: Lista audit
+      parameters:
+        - in: query
+          name: tenant_id
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { description: ok }
