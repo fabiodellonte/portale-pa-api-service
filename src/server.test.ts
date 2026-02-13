@@ -289,4 +289,89 @@ describe('api server auth + tenant authorization guardrails', () => {
     expect(response.json().items[0]).toMatchObject({ titolo: 'Buca via Roma', categoria: 'Viabilità', supporti: 2 });
     await app.close();
   });
+
+  it('serves assisted tags and assisted addresses endpoints', async () => {
+    const rest = mockRest();
+    vi.mocked(rest.get)
+      .mockResolvedValueOnce({ data: [{ slug: 'viabilita', label: 'Viabilità' }, { slug: 'verde', label: 'Verde pubblico' }] })
+      .mockResolvedValueOnce({ data: [{ id: 'a1', address: 'Via Roma 24', reference_code: 'VRM24', lat: 41.9, lng: 12.5 }] });
+
+    const app = await buildServer(rest);
+
+    const tagsResponse = await app.inject({ method: 'GET', url: `/v1/segnalazioni/assisted-tags?tenant_id=${TENANT_A}&q=via` });
+    expect(tagsResponse.statusCode).toBe(200);
+    expect(tagsResponse.json().items).toHaveLength(1);
+
+    const addressesResponse = await app.inject({ method: 'GET', url: `/v1/segnalazioni/assisted-addresses?tenant_id=${TENANT_A}&q=via%20roma` });
+    expect(addressesResponse.statusCode).toBe(200);
+    expect(addressesResponse.json().items).toHaveLength(1);
+
+    await app.close();
+  });
+
+  it('validates assisted address against deterministic tenant catalog', async () => {
+    const rest = mockRest();
+    vi.mocked(rest.get).mockResolvedValueOnce({ data: [{ id: 'a1', address: 'Via Roma 24', reference_code: 'VRM24', lat: 41.9, lng: 12.5, source_dataset: 'demo' }] });
+
+    const app = await buildServer(rest);
+    const okResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/segnalazioni/assisted-addresses/validate',
+      payload: { tenant_id: TENANT_A, catalog_id: '4386f06c-8d0c-4a99-a157-d3576447add0', address: 'Via Roma, 24' }
+    });
+
+    expect(okResponse.statusCode).toBe(200);
+    expect(okResponse.json()).toMatchObject({ validated: true, reference_code: 'VRM24' });
+    await app.close();
+  });
+
+  it('enforces strict address validation and persists guided metadata on wizard submit', async () => {
+    const rest = mockRest();
+    vi.mocked(rest.post).mockResolvedValue({ data: [{ id: 's1', codice: 'SGN-1', stato: 'in_attesa', titolo: 'Buche via Roma' }] });
+
+    const strictApp = await buildServer(rest);
+    const strictReject = await strictApp.inject({
+      method: 'POST',
+      url: '/v1/segnalazioni/wizard',
+      payload: { tenant_id: TENANT_A, titolo: 'Buche via Roma', descrizione: 'Descrizione abbastanza lunga per passare il controllo.' }
+    });
+    expect(strictReject.statusCode).toBe(422);
+    await strictApp.close();
+
+    vi.mocked(rest.get)
+      .mockResolvedValueOnce({ data: [{ slug: 'viabilita', label: 'Viabilità' }] })
+      .mockResolvedValueOnce({ data: [{ id: 'a1', address: 'Via Roma 24', reference_code: 'VRM24', lat: 41.9, lng: 12.5, source_dataset: 'demo' }] });
+
+    const app = await buildServer(rest);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/segnalazioni/wizard',
+      payload: {
+        tenant_id: TENANT_A,
+        titolo: 'Buche via Roma',
+        descrizione: 'Descrizione abbastanza lunga per passare il controllo.',
+        tag_slugs: ['viabilita'],
+        address_validation: {
+          validated: true,
+          source: 'tenant_address_catalog',
+          catalog_id: '4386f06c-8d0c-4a99-a157-d3576447add0',
+          normalized_address: 'Via Roma 24',
+          reference_code: 'VRM24',
+          lat: 41.9,
+          lng: 12.5,
+          confidence: 1
+        }
+      }
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(rest.post).toHaveBeenCalledWith('/segnalazioni', expect.objectContaining({
+      address: 'Via Roma 24',
+      tags: ['viabilita'],
+      metadata: expect.objectContaining({
+        address_validation: expect.objectContaining({ validated: true, reference_code: 'VRM24' })
+      })
+    }), expect.anything());
+    await app.close();
+  });
 });

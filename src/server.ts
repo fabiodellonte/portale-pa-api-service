@@ -68,7 +68,36 @@ const prioritiesQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(20).default(10)
 });
 
+const assistedTagsQuerySchema = z.object({
+  tenant_id: z.string().uuid(),
+  q: z.string().min(1).max(60).optional(),
+  limit: z.coerce.number().int().min(1).max(50).default(20)
+});
+
+const assistedAddressQuerySchema = z.object({
+  tenant_id: z.string().uuid(),
+  q: z.string().min(2).max(120),
+  limit: z.coerce.number().int().min(1).max(20).default(8)
+});
+
+const assistedAddressValidateSchema = z.object({
+  tenant_id: z.string().uuid(),
+  catalog_id: z.string().uuid(),
+  address: z.string().min(3)
+});
+
 const toggleSchema = z.object({ tenant_id: z.string().uuid(), user_id: z.string().uuid() });
+
+const addressValidationSchema = z.object({
+  validated: z.boolean(),
+  source: z.literal('tenant_address_catalog'),
+  catalog_id: z.string().uuid(),
+  normalized_address: z.string().min(3),
+  reference_code: z.string().min(2),
+  lat: z.number(),
+  lng: z.number(),
+  confidence: z.number().min(0).max(1).optional()
+});
 
 const wizardPayloadSchema = z.object({
   tenant_id: z.string().uuid(),
@@ -80,6 +109,8 @@ const wizardPayloadSchema = z.object({
   lat: z.number().optional(),
   lng: z.number().optional(),
   tags: z.array(z.string().min(1)).max(10).optional(),
+  tag_slugs: z.array(z.string().min(1)).max(10).optional(),
+  address_validation: addressValidationSchema.optional(),
   attachments: z.array(z.string().url()).max(8).optional(),
   metadata: z.record(z.any()).optional(),
   user_id: z.string().uuid().optional()
@@ -190,6 +221,20 @@ function isInvalid<T>(reply: any, parsed: z.SafeParseReturnType<any, T>): parsed
 
 function codiceSegnalazione() {
   return `SGN-${Date.now()}`;
+}
+
+function normalizeText(value: string) {
+  return value
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isAddressValidationStrict() {
+  return (process.env.WIZARD_ADDRESS_VALIDATION_MODE ?? 'strict').toLowerCase() !== 'soft';
 }
 
 function sanitizeHeaders(headers: Record<string, unknown>) {
@@ -1106,11 +1151,153 @@ export async function buildServer(
     }
   });
 
+  app.get('/v1/segnalazioni/assisted-tags', async (req, reply) => {
+    const q = assistedTagsQuerySchema.safeParse(req.query);
+    if (isInvalid(reply, q)) return;
+
+    try {
+      const { data } = await rest.get('/tenant_tag_catalog', {
+        params: {
+          select: 'id,slug,label,sort_order',
+          tenant_id: `eq.${q.data.tenant_id}`,
+          is_active: 'eq.true',
+          order: 'sort_order.asc,label.asc',
+          limit: String(q.data.limit)
+        }
+      });
+
+      const query = q.data.q ? normalizeText(q.data.q) : '';
+      const items = (data ?? []).filter((row: any) => {
+        if (!query) return true;
+        return normalizeText(`${row.label ?? ''} ${row.slug ?? ''}`).includes(query);
+      });
+
+      return { items };
+    } catch (error: any) {
+      return reply.code(500).send({ error: error.message });
+    }
+  });
+
+  app.get('/v1/segnalazioni/assisted-addresses', async (req, reply) => {
+    const q = assistedAddressQuerySchema.safeParse(req.query);
+    if (isInvalid(reply, q)) return;
+
+    try {
+      const { data } = await rest.get('/tenant_address_catalog', {
+        params: {
+          select: 'id,address,reference_code,lat,lng',
+          tenant_id: `eq.${q.data.tenant_id}`,
+          is_active: 'eq.true',
+          order: 'address.asc',
+          limit: '200'
+        }
+      });
+
+      const query = normalizeText(q.data.q);
+      const items = (data ?? [])
+        .filter((row: any) => normalizeText(`${row.address ?? ''} ${row.reference_code ?? ''}`).includes(query))
+        .slice(0, q.data.limit);
+
+      return { items };
+    } catch (error: any) {
+      return reply.code(500).send({ error: error.message });
+    }
+  });
+
+  app.post('/v1/segnalazioni/assisted-addresses/validate', async (req, reply) => {
+    const body = assistedAddressValidateSchema.safeParse(req.body);
+    if (isInvalid(reply, body)) return;
+
+    try {
+      const { data } = await rest.get('/tenant_address_catalog', {
+        params: {
+          select: 'id,address,reference_code,lat,lng,source_dataset',
+          tenant_id: `eq.${body.data.tenant_id}`,
+          id: `eq.${body.data.catalog_id}`,
+          is_active: 'eq.true',
+          limit: '1'
+        }
+      });
+
+      const found = data?.[0];
+      if (!found) return reply.code(404).send({ error: 'Address reference not found for tenant' });
+
+      const valid = normalizeText(found.address ?? '') === normalizeText(body.data.address);
+      if (!valid) {
+        return reply.code(422).send({
+          error: 'Address validation failed: selected suggestion does not match input address.'
+        });
+      }
+
+      return {
+        validated: true,
+        source: 'tenant_address_catalog',
+        catalog_id: found.id,
+        normalized_address: found.address,
+        reference_code: found.reference_code,
+        lat: Number(found.lat),
+        lng: Number(found.lng),
+        confidence: 1,
+        dataset: found.source_dataset ?? 'local'
+      };
+    } catch (error: any) {
+      return reply.code(500).send({ error: error.message });
+    }
+  });
+
   app.post('/v1/segnalazioni/wizard', async (req, reply) => {
     const body = wizardPayloadSchema.safeParse(req.body);
     if (isInvalid(reply, body)) return;
 
     try {
+      const requestedTagSlugs = Array.from(new Set((body.data.tag_slugs ?? body.data.tags ?? []).map((tag) => tag.trim().toLowerCase()).filter(Boolean)));
+      const addressValidation = body.data.address_validation;
+      const strictAddressValidation = isAddressValidationStrict();
+
+      if (strictAddressValidation && (!addressValidation || !addressValidation.validated)) {
+        return reply.code(422).send({
+          error: 'Address must be validated before submit. Seleziona un suggerimento e conferma validazione indirizzo.'
+        });
+      }
+
+      const [tagsRes, validatedAddressRes] = await Promise.all([
+        requestedTagSlugs.length > 0
+          ? rest.get('/tenant_tag_catalog', {
+            params: {
+              select: 'slug,label',
+              tenant_id: `eq.${body.data.tenant_id}`,
+              is_active: 'eq.true',
+              slug: `in.(${requestedTagSlugs.map((slug) => `"${slug.replace(/"/g, '')}"`).join(',')})`
+            }
+          })
+          : Promise.resolve({ data: [] as Array<{ slug: string; label: string }> }),
+        addressValidation?.catalog_id
+          ? rest.get('/tenant_address_catalog', {
+            params: {
+              select: 'id,address,reference_code,lat,lng,source_dataset',
+              tenant_id: `eq.${body.data.tenant_id}`,
+              id: `eq.${addressValidation.catalog_id}`,
+              is_active: 'eq.true',
+              limit: '1'
+            }
+          })
+          : Promise.resolve({ data: [] as Array<Record<string, unknown>> })
+      ]);
+
+      const allowedTags = (tagsRes.data ?? []).map((row: any) => row.slug).filter(Boolean);
+      if (allowedTags.length !== requestedTagSlugs.length) {
+        return reply.code(422).send({ error: 'One or more selected tags are not allowed for this tenant.' });
+      }
+
+      const validatedAddress = validatedAddressRes.data?.[0] as any;
+      if (strictAddressValidation && !validatedAddress) {
+        return reply.code(422).send({ error: 'Address validation missing or expired. Ripetere la verifica indirizzo.' });
+      }
+
+      const finalAddress = validatedAddress?.address ?? body.data.address;
+      const finalLat = validatedAddress?.lat !== undefined ? Number(validatedAddress.lat) : body.data.lat;
+      const finalLng = validatedAddress?.lng !== undefined ? Number(validatedAddress.lng) : body.data.lng;
+
       const createdPayload = {
         tenant_id: body.data.tenant_id,
         codice: codiceSegnalazione(),
@@ -1118,12 +1305,27 @@ export async function buildServer(
         descrizione: body.data.descrizione,
         category_id: body.data.category_id,
         neighborhood_id: body.data.neighborhood_id,
-        address: body.data.address,
-        lat: body.data.lat,
-        lng: body.data.lng,
+        address: finalAddress,
+        lat: finalLat,
+        lng: finalLng,
         attachments: body.data.attachments ?? [],
-        tags: body.data.tags ?? [],
-        metadata: body.data.metadata ?? {},
+        tags: allowedTags,
+        metadata: {
+          ...(body.data.metadata ?? {}),
+          address_validation: validatedAddress
+            ? {
+              validated: true,
+              source: 'tenant_address_catalog',
+              catalog_id: validatedAddress.id,
+              normalized_address: validatedAddress.address,
+              reference_code: validatedAddress.reference_code,
+              lat: Number(validatedAddress.lat),
+              lng: Number(validatedAddress.lng),
+              dataset: validatedAddress.source_dataset ?? 'local',
+              confidence: addressValidation?.confidence ?? 1
+            }
+            : { validated: false, mode: strictAddressValidation ? 'strict' : 'soft' }
+        },
         created_by: body.data.user_id
       };
 
