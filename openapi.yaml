@@ -404,6 +404,57 @@ paths:
                     description: Interesse continuativo
                     weight: 0.15
 
+  /v1/tenants:
+    get:
+      tags: [Tenant]
+      summary: Lista tenant
+      responses:
+        '200': { $ref: '#/components/responses/AnyJsonOk' }
+    post:
+      tags: [Tenant]
+      summary: Crea tenant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '201': { $ref: '#/components/responses/AnyJsonOk' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+
+  /v1/pratiche:
+    get:
+      tags: [Public]
+      summary: Lista pratiche
+      parameters:
+        - in: query
+          name: tenant_id
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { $ref: '#/components/responses/AnyJsonOk' }
+    post:
+      tags: [Public]
+      summary: Crea pratica
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '201': { $ref: '#/components/responses/AnyJsonOk' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+
+  /v1/audit:
+    get:
+      tags: [Admin]
+      summary: Lista audit
+      parameters:
+        - in: query
+          name: tenant_id
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { $ref: '#/components/responses/AnyJsonOk' }
+
 components:
   parameters:
     XUserId:
