@@ -1,106 +1,654 @@
 openapi: 3.0.3
 info:
   title: Portale PA API Service
-  version: 0.1.0
+  version: 0.4.0
+  description: |
+    API facade verso Supabase/PostgREST per Portale PA.
+    Nota: le route protette richiedono gli header `x-user-id` e `x-tenant-id` (UUID).
 servers:
   - url: http://localhost:8080
+
+tags:
+  - name: Health
+  - name: Auth Proxy
+  - name: Me
+  - name: Tenant
+  - name: Admin
+  - name: Segnalazioni
+  - name: Public
+
 paths:
   /health:
     get:
+      tags: [Health]
       summary: Healthcheck
       responses:
         '200':
-          description: ok
-  /v1/tenants:
+          description: Servizio operativo
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, example: true }
+                  service: { type: string, example: portale-pa-api-service }
+
+  /v1/auth/{proxy+}:
+    parameters:
+      - $ref: '#/components/parameters/ProxyPlusPath'
     get:
-      summary: Lista tenant
+      tags: [Auth Proxy]
+      summary: Proxy GET verso Supabase Auth
+      description: |
+        Inoltra richiesta e querystring a `/auth/v1/{proxy}` di Supabase.
+        Sono inoltrati quasi tutti gli header originali (esclusi host/connection/content-length).
       responses:
-        '200': { description: ok }
+        '200': { $ref: '#/components/responses/AnyJsonOk' }
+        '4XX': { $ref: '#/components/responses/AuthProxyError' }
+        '5XX': { $ref: '#/components/responses/AuthProxyError' }
     post:
-      summary: Crea tenant
+      tags: [Auth Proxy]
+      summary: Proxy POST verso Supabase Auth
+      description: Inoltra body/query/header a `/auth/v1/{proxy}`.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '200': { $ref: '#/components/responses/AnyJsonOk' }
+        '4XX': { $ref: '#/components/responses/AuthProxyError' }
+        '5XX': { $ref: '#/components/responses/AuthProxyError' }
+
+  /v1/me/access:
+    get:
+      tags: [Me]
+      summary: Access context dell'utente corrente
+      parameters:
+        - $ref: '#/components/parameters/XUserId'
+        - $ref: '#/components/parameters/XTenantId'
+      responses:
+        '200':
+          description: Permessi calcolati
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MeAccess'
+              example:
+                user_id: 1386f06c-8d0c-4a99-a157-d3576447add1
+                tenant_id: 1386f06c-8d0c-4a99-a157-d3576447add0
+                roles: [tenant_admin]
+                can_manage_branding: true
+                can_manage_roles: false
+                can_manage_language: true
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/me/preferences:
+    get:
+      tags: [Me]
+      summary: Preferenze utente
+      parameters:
+        - $ref: '#/components/parameters/XUserId'
+        - $ref: '#/components/parameters/XTenantId'
+      responses:
+        '200':
+          description: Lingua preferita
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserLanguagePreference'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/me/preferences/language:
+    put:
+      tags: [Me]
+      summary: Aggiorna lingua preferita
+      parameters:
+        - $ref: '#/components/parameters/XUserId'
+        - $ref: '#/components/parameters/XTenantId'
       requestBody:
         required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LanguageUpdateRequest'
+            example:
+              language: en
       responses:
-        '201': { description: created }
-  /v1/pratiche:
+        '200':
+          description: Lingua aggiornata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserLanguagePreference'
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/tenants/{id}/branding:
+    parameters:
+      - $ref: '#/components/parameters/TenantIdPath'
     get:
-      summary: Lista pratiche
+      tags: [Tenant]
+      summary: Leggi branding tenant
       parameters:
+        - $ref: '#/components/parameters/XUserId'
+        - $ref: '#/components/parameters/XTenantId'
+      responses:
+        '200':
+          description: Branding del tenant (o default)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantBranding'
+              example:
+                tenant_id: 1386f06c-8d0c-4a99-a157-d3576447add0
+                logo_url: https://cdn.example.gov/logo.png
+                primary_color: '#0055A4'
+                secondary_color: '#FFFFFF'
+                font_family: Inter
+                header_variant: standard
+                footer_text: Comune di Esempio
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Branding di altro tenant non consentito
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+    put:
+      tags: [Tenant]
+      summary: Aggiorna branding tenant
+      parameters:
+        - $ref: '#/components/parameters/XUserId'
+        - $ref: '#/components/parameters/XTenantId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenantBrandingUpdateRequest'
+      responses:
+        '200':
+          description: Branding aggiornato
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantBranding'
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Ruolo insufficiente o tenant non autorizzato
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /v1/admin/roles:
+    get:
+      tags: [Admin]
+      summary: Lista ruoli utente (solo super_admin)
+      parameters:
+        - $ref: '#/components/parameters/XUserId'
+        - $ref: '#/components/parameters/XTenantId'
+        - in: query
+          name: user_id
+          schema: { type: string, format: uuid }
         - in: query
           name: tenant_id
           schema: { type: string, format: uuid }
       responses:
-        '200': { description: ok }
-    post:
-      summary: Crea pratica
+        '200':
+          description: Elenco assegnazioni ruolo
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/AdminRoleItem' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/ForbiddenGlobalAdmin' }
+
+  /v1/admin/roles/{id}:
+    put:
+      tags: [Admin]
+      summary: Assegna ruolo ad un utente (solo super_admin)
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/XUserId'
+        - $ref: '#/components/parameters/XTenantId'
       requestBody:
         required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoleAssignmentRequest'
       responses:
-        '201': { description: created }
-  /v1/audit:
-    get:
-      summary: Lista audit
-      parameters:
-        - in: query
-          name: tenant_id
-          schema: { type: string, format: uuid }
-      responses:
-        '200': { description: ok }
-  /v1/public/transparency/ranking:
-    get:
-      summary: Metadata pubblica formula ranking segnalazioni
-      responses:
-        '200': { description: ok }
+        '200':
+          description: Ruolo assegnato
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoleAssignmentResult' }
+        '400':
+          description: Tenant incoerente con profilo utente
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/ForbiddenGlobalAdmin' }
+        '404':
+          description: Profilo o ruolo non trovato
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
   /v1/admin/segnalazioni/{id}/status-transition:
     post:
-      summary: Transizione di stato segnalazione (ruoli admin)
+      tags: [Admin, Segnalazioni]
+      summary: Transizione stato segnalazione
       parameters:
-        - in: path
-          name: id
-          required: true
-          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/SegnalazioneIdPath'
+        - $ref: '#/components/parameters/XUserId'
+        - $ref: '#/components/parameters/XTenantId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StatusTransitionRequest' }
       responses:
-        '200': { description: ok }
-        '403': { description: forbidden }
+        '200':
+          description: Segnalazione aggiornata
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  item: { type: object, additionalProperties: true }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/ForbiddenTenantAdmin' }
+        '404':
+          description: Segnalazione non trovata per tenant
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '409':
+          description: Transizione non consentita
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
   /v1/admin/segnalazioni/{id}/assign:
     post:
-      summary: Assegna segnalazione a operatore (ruoli admin)
+      tags: [Admin, Segnalazioni]
+      summary: Assegna segnalazione a operatore
       parameters:
-        - in: path
-          name: id
-          required: true
-          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/SegnalazioneIdPath'
+        - $ref: '#/components/parameters/XUserId'
+        - $ref: '#/components/parameters/XTenantId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AssignSegnalazioneRequest' }
       responses:
-        '200': { description: ok }
-        '403': { description: forbidden }
+        '200':
+          description: Assegnazione registrata
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  item: { type: object, additionalProperties: true }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/ForbiddenTenantAdmin' }
+        '404':
+          description: Segnalazione non trovata per tenant
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
   /v1/admin/segnalazioni/{id}/public-response:
     post:
-      summary: Pubblica risposta ufficiale su segnalazione (ruoli admin)
+      tags: [Admin, Segnalazioni]
+      summary: Pubblica risposta ufficiale su segnalazione
       parameters:
-        - in: path
-          name: id
-          required: true
-          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/SegnalazioneIdPath'
+        - $ref: '#/components/parameters/XUserId'
+        - $ref: '#/components/parameters/XTenantId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PublicResponseRequest' }
       responses:
-        '200': { description: ok }
-        '403': { description: forbidden }
+        '200':
+          description: Risposta pubblica registrata
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, example: true }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/ForbiddenTenantAdmin' }
+        '404':
+          description: Segnalazione non trovata per tenant
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
   /v1/admin/segnalazioni/{id}/moderation-flags:
     post:
-      summary: Aggiorna flag moderazione segnalazione (ruoli admin)
+      tags: [Admin, Segnalazioni]
+      summary: Aggiorna flag di moderazione segnalazione
       parameters:
-        - in: path
-          name: id
-          required: true
-          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/SegnalazioneIdPath'
+        - $ref: '#/components/parameters/XUserId'
+        - $ref: '#/components/parameters/XTenantId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ModerationFlagsRequest' }
       responses:
-        '200': { description: ok }
-        '403': { description: forbidden }
-  /v1/auth/{proxy+}:
+        '200':
+          description: Flag aggiornati
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, example: true }
+                  moderation_flags: { type: object, additionalProperties: true }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/ForbiddenTenantAdmin' }
+        '404':
+          description: Segnalazione non trovata per tenant
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /v1/public/transparency/ranking:
     get:
-      summary: Proxy GET verso Supabase Auth locale
+      tags: [Public]
+      summary: Formula pubblica ranking trasparenza segnalazioni
       responses:
-        '200': { description: ok }
-    post:
-      summary: Proxy POST verso Supabase Auth locale
-      responses:
-        '200': { description: ok }
+        '200':
+          description: Parametri ranking correnti
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransparencyRankingResponse'
+              example:
+                algorithm: weighted_sum
+                version: 2026-02-phase3
+                normalized: true
+                total_weight: 1
+                factors:
+                  - factor: votes
+                    description: Supporto civico diretto
+                    weight: 0.4
+                  - factor: severity
+                    description: Impatto e gravità
+                    weight: 0.25
+                  - factor: freshness
+                    description: Recenza segnalazione
+                    weight: 0.2
+                  - factor: follows
+                    description: Interesse continuativo
+                    weight: 0.15
+
+components:
+  parameters:
+    XUserId:
+      in: header
+      name: x-user-id
+      required: true
+      schema: { type: string, format: uuid }
+      description: UUID utente autenticato
+    XTenantId:
+      in: header
+      name: x-tenant-id
+      required: true
+      schema: { type: string, format: uuid }
+      description: UUID tenant di contesto
+    TenantIdPath:
+      in: path
+      name: id
+      required: true
+      schema: { type: string, format: uuid }
+    UserIdPath:
+      in: path
+      name: id
+      required: true
+      schema: { type: string, format: uuid }
+    SegnalazioneIdPath:
+      in: path
+      name: id
+      required: true
+      schema: { type: string, format: uuid }
+    ProxyPlusPath:
+      in: path
+      name: proxy+
+      required: true
+      schema:
+        type: string
+      description: Path wildcard inoltrato a Supabase Auth (es. token?grant_type=password)
+
+  responses:
+    AnyJsonOk:
+      description: Risposta JSON passthrough
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: true
+    AuthProxyError:
+      description: Errore propagato da provider auth o errore locale proxy
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: true
+    ValidationError:
+      description: Input non valido (Zod)
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                additionalProperties: true
+    Unauthorized:
+      description: Header auth mancanti/non validi o profilo non trovato
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example: { error: Missing or invalid x-user-id/x-tenant-id headers }
+    ForbiddenTenantAdmin:
+      description: Ruolo insufficiente per operazioni tenant_admin
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example: { error: Insufficient role for tenant admin operation }
+    ForbiddenGlobalAdmin:
+      description: Ruolo insufficiente per operazioni super_admin
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example: { error: Insufficient role for global admin operation }
+
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        error: { type: string }
+      required: [error]
+
+    MeAccess:
+      type: object
+      required: [user_id, tenant_id, roles, can_manage_branding, can_manage_roles, can_manage_language]
+      properties:
+        user_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        roles:
+          type: array
+          items:
+            type: string
+            enum: [super_admin, tenant_admin, operatore, cittadino]
+        can_manage_branding: { type: boolean }
+        can_manage_roles: { type: boolean }
+        can_manage_language: { type: boolean }
+
+    UserLanguagePreference:
+      type: object
+      required: [user_id, language]
+      properties:
+        user_id: { type: string, format: uuid }
+        language:
+          type: string
+          enum: [it, en]
+
+    LanguageUpdateRequest:
+      type: object
+      required: [language]
+      properties:
+        language:
+          type: string
+          enum: [it, en]
+
+    TenantBranding:
+      type: object
+      properties:
+        tenant_id: { type: string, format: uuid }
+        logo_url: { type: string, format: uri, nullable: true }
+        primary_color: { type: string, pattern: '^#([A-Fa-f0-9]{6})$' }
+        secondary_color: { type: string, pattern: '^#([A-Fa-f0-9]{6})$' }
+        font_family: { type: string, maxLength: 120, nullable: true }
+        header_variant:
+          type: string
+          nullable: true
+          enum: [standard, compact]
+        footer_text: { type: string, maxLength: 240, nullable: true }
+
+    TenantBrandingUpdateRequest:
+      type: object
+      required: [primary_color, secondary_color]
+      properties:
+        logo_url: { type: string, format: uri, nullable: true }
+        primary_color: { type: string, pattern: '^#([A-Fa-f0-9]{6})$' }
+        secondary_color: { type: string, pattern: '^#([A-Fa-f0-9]{6})$' }
+        font_family: { type: string, maxLength: 120, nullable: true }
+        header_variant:
+          type: string
+          nullable: true
+          enum: [standard, compact]
+        footer_text: { type: string, maxLength: 240, nullable: true }
+
+    AdminRoleItem:
+      type: object
+      properties:
+        user_id: { type: string, format: uuid }
+        role_id: { type: string, format: uuid }
+        roles:
+          type: object
+          properties:
+            code: { type: string, enum: [super_admin, tenant_admin, operatore, cittadino] }
+            name: { type: string }
+        user_profiles:
+          type: object
+          properties:
+            tenant_id: { type: string, format: uuid }
+            full_name: { type: string, nullable: true }
+
+    RoleAssignmentRequest:
+      type: object
+      required: [tenant_id, role_code]
+      properties:
+        tenant_id: { type: string, format: uuid }
+        role_code:
+          type: string
+          enum: [super_admin, tenant_admin, operatore, cittadino]
+
+    RoleAssignmentResult:
+      type: object
+      required: [user_id, tenant_id, role_code]
+      properties:
+        user_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        role_code:
+          type: string
+          enum: [super_admin, tenant_admin, operatore, cittadino]
+
+    SegnalazioneAdminBase:
+      type: object
+      required: [tenant_id]
+      properties:
+        tenant_id: { type: string, format: uuid }
+
+    StatusTransitionRequest:
+      allOf:
+        - $ref: '#/components/schemas/SegnalazioneAdminBase'
+        - type: object
+          required: [status]
+          properties:
+            status:
+              type: string
+              enum: [in_attesa, presa_in_carico, in_lavorazione, risolta, chiusa, respinta]
+            message: { type: string, minLength: 3, maxLength: 500 }
+
+    AssignSegnalazioneRequest:
+      allOf:
+        - $ref: '#/components/schemas/SegnalazioneAdminBase'
+        - type: object
+          required: [assigned_to]
+          properties:
+            assigned_to: { type: string, format: uuid }
+            message: { type: string, minLength: 3, maxLength: 500 }
+
+    PublicResponseRequest:
+      allOf:
+        - $ref: '#/components/schemas/SegnalazioneAdminBase'
+        - type: object
+          required: [message]
+          properties:
+            message: { type: string, minLength: 3, maxLength: 2000 }
+
+    ModerationFlagsRequest:
+      allOf:
+        - $ref: '#/components/schemas/SegnalazioneAdminBase'
+        - type: object
+          required: [flags]
+          properties:
+            flags:
+              type: object
+              properties:
+                hidden: { type: boolean }
+                abusive: { type: boolean }
+                duplicate_of: { type: string, format: uuid }
+                requires_review: { type: boolean }
+                note: { type: string, maxLength: 500 }
+
+    TransparencyRankingResponse:
+      type: object
+      required: [algorithm, version, normalized, total_weight, factors]
+      properties:
+        algorithm: { type: string, example: weighted_sum }
+        version: { type: string, example: 2026-02-phase3 }
+        normalized: { type: boolean }
+        total_weight: { type: number }
+        factors:
+          type: array
+          items:
+            type: object
+            properties:
+              factor: { type: string }
+              description: { type: string }
+              weight: { type: number }
