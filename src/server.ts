@@ -23,7 +23,7 @@ const accessQuerySchema = z.object({ user_id: z.string().uuid().optional(), tena
 const languageSchema = z.object({ language: z.enum(['it', 'en']) });
 const avatarUploadSchema = z.object({
   filename: z.string().min(1).max(160),
-  mime_type: z.enum(['image/jpeg', 'image/png', 'image/webp']),
+  mime_type: z.enum(['image/jpeg', 'image/jpg', 'image/pjpeg', 'image/png', 'image/webp']),
   content_base64: z.string().min(16)
 });
 const brandingSchema = z.object({
@@ -268,6 +268,12 @@ const avatarMimeExtensions: Record<'image/jpeg' | 'image/png' | 'image/webp', st
   'image/webp': 'webp'
 };
 
+function normalizeAvatarMimeType(mimeType: string): 'image/jpeg' | 'image/png' | 'image/webp' {
+  if (mimeType === 'image/jpg' || mimeType === 'image/pjpeg') return 'image/jpeg';
+  if (mimeType === 'image/png' || mimeType === 'image/webp' || mimeType === 'image/jpeg') return mimeType;
+  throw new Error('Unsupported avatar mime type');
+}
+
 const maxAvatarBytes = 2 * 1024 * 1024;
 
 function sanitizeFilenameBase(value: string) {
@@ -284,9 +290,10 @@ function buildAvatarPublicUrl(filename: string) {
   return `${base.replace(/\/$/, '')}/public/avatars/${filename}`;
 }
 
-async function storeAvatarImage(input: { tenantId: string; userId: string; filename: string; mimeType: 'image/jpeg' | 'image/png' | 'image/webp'; contentBase64: string }) {
+async function storeAvatarImage(input: { tenantId: string; userId: string; filename: string; mimeType: 'image/jpeg' | 'image/jpg' | 'image/pjpeg' | 'image/png' | 'image/webp'; contentBase64: string }) {
   const safeBase = sanitizeFilenameBase(input.filename);
-  const ext = avatarMimeExtensions[input.mimeType];
+  const normalizedMimeType = normalizeAvatarMimeType(input.mimeType);
+  const ext = avatarMimeExtensions[normalizedMimeType];
   const finalFilename = `${input.tenantId}-${input.userId}-${safeBase}-${randomUUID()}.${ext}`;
   const content = Buffer.from(input.contentBase64, 'base64');
 
@@ -300,7 +307,7 @@ async function storeAvatarImage(input: { tenantId: string; userId: string; filen
   return {
     avatar_url: buildAvatarPublicUrl(finalFilename),
     avatar_meta: {
-      mime_type: input.mimeType,
+      mime_type: normalizedMimeType,
       size_bytes: content.length,
       original_filename: input.filename,
       stored_filename: finalFilename,
