@@ -29,6 +29,7 @@ jobs:
 
       - name: Email report
         if: always()
+        continue-on-error: true
         env:
           SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -47,7 +48,8 @@ jobs:
           required = ['SMTP_SERVER','SMTP_PORT','SMTP_USERNAME','SMTP_PASSWORD','SMTP_FROM']
           missing = [k for k in required if not os.environ.get(k)]
           if missing:
-              raise RuntimeError(f"Missing SMTP secrets: {', '.join(missing)}")
+              print(f"Skipping email report: missing SMTP secrets: {', '.join(missing)}")
+              raise SystemExit(0)
 
           msg = EmailMessage()
           msg['Subject'] = f"[{os.environ['REPO']}] CI {os.environ['CI_STATUS']}"
