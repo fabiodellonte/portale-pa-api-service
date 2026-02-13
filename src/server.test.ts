@@ -31,6 +31,7 @@ describe('api server auth + tenant authorization guardrails', () => {
   afterEach(() => {
     vi.restoreAllMocks();
     delete process.env.ENABLE_DEMO_MODE_SWITCH;
+    delete process.env.ENABLE_FULL_DEMO_SEED;
   });
 
   it('returns 401 on protected endpoints when auth headers are missing', async () => {
@@ -208,6 +209,19 @@ describe('api server auth + tenant authorization guardrails', () => {
     await app.close();
   });
 
+  it('returns tenant label for authenticated users', async () => {
+    const rest = mockRest();
+    primeAccess(rest, 'cittadino', TENANT_A);
+    vi.mocked(rest.get).mockResolvedValueOnce({ data: [{ id: TENANT_A, name: 'Pesaro' }] });
+
+    const app = await buildServer(rest);
+    const response = await app.inject({ method: 'GET', url: '/v1/me/tenant-label', headers: authHeaders(TENANT_A) });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ tenant_id: TENANT_A, tenant_name: 'Pesaro', label: 'Città di Pesaro' });
+    await app.close();
+  });
+
   it('blocks demo-mode endpoints when feature flag is disabled', async () => {
     const rest = mockRest();
     primeAccess(rest, 'super_admin', TENANT_A);
@@ -261,6 +275,40 @@ describe('api server auth + tenant authorization guardrails', () => {
     expect(demoModeExecutor).toHaveBeenNthCalledWith(3, 'status');
 
     await app.close();
+  });
+
+  it('blocks full demo seed endpoint when feature flag is disabled', async () => {
+    const rest = mockRest();
+    primeAccess(rest, 'super_admin', TENANT_A);
+    const app = await buildServer(rest, undefined as any, { demoSeedExecutor: vi.fn().mockResolvedValue({ output: 'ok' }) });
+
+    const response = await app.inject({ method: 'POST', url: '/v1/admin/demo-seed/full', headers: authHeaders(TENANT_A) });
+
+    expect(response.statusCode).toBe(404);
+    await app.close();
+  });
+
+  it('allows full demo seed only for global admin and explicit flag', async () => {
+    process.env.ENABLE_FULL_DEMO_SEED = 'true';
+
+    const restDenied = mockRest();
+    primeAccess(restDenied, 'tenant_admin', TENANT_A);
+    const deniedApp = await buildServer(restDenied, undefined as any, { demoSeedExecutor: vi.fn().mockResolvedValue({ output: 'ok' }) });
+
+    const denied = await deniedApp.inject({ method: 'POST', url: '/v1/admin/demo-seed/full', headers: authHeaders(TENANT_A) });
+    expect(denied.statusCode).toBe(403);
+    await deniedApp.close();
+
+    const restAllowed = mockRest();
+    primeAccess(restAllowed, 'super_admin', TENANT_A);
+    const demoSeedExecutor = vi.fn().mockResolvedValue({ output: 'seed loaded' });
+    const allowedApp = await buildServer(restAllowed, undefined as any, { demoSeedExecutor });
+
+    const allowed = await allowedApp.inject({ method: 'POST', url: '/v1/admin/demo-seed/full', headers: authHeaders(TENANT_A) });
+    expect(allowed.statusCode).toBe(200);
+    expect(allowed.json()).toMatchObject({ ok: true });
+    expect(demoSeedExecutor).toHaveBeenCalledTimes(1);
+    await allowedApp.close();
   });
 
   it('returns duplicate candidates from dedicated endpoint', async () => {

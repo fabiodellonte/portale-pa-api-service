@@ -192,8 +192,10 @@ type EmailChannelConfig = {
 type DemoModeAction = 'status' | 'on' | 'off';
 type DemoModeState = 'on' | 'off' | 'unknown';
 type DemoModeExecutor = (action: DemoModeAction) => Promise<{ state: DemoModeState; output: string }>;
+type DemoSeedExecutor = () => Promise<{ output: string }>;
 type BuildServerOptions = {
   demoModeExecutor?: DemoModeExecutor;
+  demoSeedExecutor?: DemoSeedExecutor;
 };
 
 const execFileAsync = promisify(execFile);
@@ -280,6 +282,19 @@ function createDemoModeExecutor(scriptPath: string): DemoModeExecutor {
 
 function isDemoModeSwitchEnabled() {
   return process.env.ENABLE_DEMO_MODE_SWITCH === 'true';
+}
+
+function createDemoSeedExecutor(scriptPath: string): DemoSeedExecutor {
+  return async () => {
+    const { stdout, stderr } = await execFileAsync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, '-Mode', 'on'], {
+      windowsHide: true
+    });
+    return { output: [stdout, stderr].filter(Boolean).join('\n').trim() };
+  };
+}
+
+function isFullDemoSeedEnabled() {
+  return process.env.ENABLE_FULL_DEMO_SEED === 'true';
 }
 
 async function queueAdminEmailNotification(
@@ -483,9 +498,9 @@ export async function buildServer(
   const app = Fastify({ logger: true });
   await app.register(cors, { origin: true });
 
-  const demoModeExecutor = options.demoModeExecutor ?? createDemoModeExecutor(
-    process.env.DEMO_MODE_SCRIPT_PATH ?? path.resolve(process.cwd(), '..', 'portale-pa-backend-supabase', 'scripts', 'demo-mode.ps1')
-  );
+  const demoScriptPath = process.env.DEMO_MODE_SCRIPT_PATH ?? path.resolve(process.cwd(), '..', 'portale-pa-backend-supabase', 'scripts', 'demo-mode.ps1');
+  const demoModeExecutor = options.demoModeExecutor ?? createDemoModeExecutor(demoScriptPath);
+  const demoSeedExecutor = options.demoSeedExecutor ?? createDemoSeedExecutor(demoScriptPath);
 
   app.get('/health', async () => ({ ok: true, service: 'portale-pa-api-service' }));
 
@@ -526,6 +541,18 @@ export async function buildServer(
     };
   });
 
+  app.get('/v1/me/tenant-label', async (req, reply) => {
+    const access = await requireAccess(req, reply, rest, 'authenticated');
+    if (!access) return;
+
+    const { data } = await rest.get('/tenants', {
+      params: { select: 'id,name', id: `eq.${access.tenantId}`, limit: '1' }
+    });
+
+    const tenantName = String(data?.[0]?.name ?? 'Ente');
+    return { tenant_id: access.tenantId, tenant_name: tenantName, label: `Città di ${tenantName}` };
+  });
+
   app.get('/v1/admin/demo-mode', async (req, reply) => {
     const access = await requireAccess(req, reply, rest, 'global_admin');
     if (!access) return;
@@ -560,6 +587,21 @@ export async function buildServer(
         output: switched.output,
         status_output: current.output
       };
+    } catch (error: any) {
+      return reply.code(500).send({ error: error.message });
+    }
+  });
+
+  app.post('/v1/admin/demo-seed/full', async (req, reply) => {
+    const access = await requireAccess(req, reply, rest, 'global_admin');
+    if (!access) return;
+    if (!isFullDemoSeedEnabled()) {
+      return reply.code(404).send({ error: 'Full demo seed disabled' });
+    }
+
+    try {
+      const seeded = await demoSeedExecutor();
+      return { ok: true, message: 'Dataset demo completo caricato con successo.', output: seeded.output };
     } catch (error: any) {
       return reply.code(500).send({ error: error.message });
     }
