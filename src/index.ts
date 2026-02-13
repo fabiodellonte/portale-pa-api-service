@@ -11,7 +11,7 @@ const host = process.env.API_HOST ?? '0.0.0.0';
 const supabaseUrl = process.env.SUPABASE_URL ?? 'http://localhost:54321';
 
 const app = Fastify({ logger: true });
-await app.register(cors, { origin: process.env.FRONTEND_ORIGIN ?? true });
+await app.register(cors, { origin: true });
 
 const rest = axios.create({
   baseURL: `${supabaseUrl}/rest/v1`,
