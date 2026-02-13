@@ -1,6 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { buildServer, type RestClient } from './server.js';
 
+const TENANT_A = '1386f06c-8d0c-4a99-a157-d3576447add0';
+const TENANT_B = '2386f06c-8d0c-4a99-a157-d3576447add0';
+const USER_ID = '1386f06c-8d0c-4a99-a157-d3576447add1';
+const SEGNALAZIONE_ID = '3386f06c-8d0c-4a99-a157-d3576447add0';
+
+type RoleCode = 'super_admin' | 'tenant_admin' | 'cittadino';
+
 function mockRest(): RestClient {
   return {
     get: vi.fn(),
@@ -10,21 +17,117 @@ function mockRest(): RestClient {
   } as unknown as RestClient;
 }
 
-describe('api server phase 4 + docs/bug flow', () => {
+function authHeaders(tenantId = TENANT_A, userId = USER_ID) {
+  return { 'x-user-id': userId, 'x-tenant-id': tenantId };
+}
+
+function primeAccess(rest: RestClient, role: RoleCode, profileTenant = TENANT_A) {
+  vi.mocked(rest.get)
+    .mockResolvedValueOnce({ data: [{ id: USER_ID, tenant_id: profileTenant }] })
+    .mockResolvedValueOnce({ data: [{ roles: { code: role } }] });
+}
+
+describe('api server auth + tenant authorization guardrails', () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it('updates language preference', async () => {
+  it('returns 401 on protected endpoints when auth headers are missing', async () => {
     const rest = mockRest();
-    vi.mocked(rest.get)
-      .mockResolvedValueOnce({ data: [{ id: 'u1', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' }] })
-      .mockResolvedValueOnce({ data: [{ roles: { code: 'cittadino' } }] });
+    const app = await buildServer(rest);
+
+    const checks = await Promise.all([
+      app.inject({ method: 'PUT', url: '/v1/me/preferences/language', payload: { language: 'en' } }),
+      app.inject({ method: 'POST', url: '/v1/bug-reports', payload: { title: 'Bug serio', description: 'Descrizione bug abbastanza lunga' } }),
+      app.inject({ method: 'GET', url: '/v1/docs/public' }),
+      app.inject({ method: 'POST', url: '/v1/admin/docs/global', payload: { slug: 'faq', title: 'FAQ', content_md: 'contenuto di prova sufficiente', is_published: true, sort_order: 1 } }),
+      app.inject({ method: 'POST', url: `/v1/admin/segnalazioni/${SEGNALAZIONE_ID}/assign`, payload: { tenant_id: TENANT_A, assigned_to: USER_ID } })
+    ]);
+
+    checks.forEach((response) => expect(response.statusCode).toBe(401));
+    expect(rest.get).not.toHaveBeenCalled();
+
+    await app.close();
+  });
+
+  it('blocks tenant mismatch on key tenant-admin phase3/4 routes', async () => {
+    const routes = [
+      {
+        url: `/v1/tenants/${TENANT_B}/branding`,
+        method: 'PUT' as const,
+        payload: { primary_color: '#0055A4', secondary_color: '#FFFFFF' }
+      },
+      {
+        url: `/v1/admin/docs/tenant/${TENANT_B}`,
+        method: 'POST' as const,
+        payload: { slug: 'regole', title: 'Regole', content_md: 'contenuto locale tenant valido', is_published: true, sort_order: 1 }
+      },
+      {
+        url: `/v1/admin/segnalazioni/${SEGNALAZIONE_ID}/status-transition`,
+        method: 'POST' as const,
+        payload: { tenant_id: TENANT_B, status: 'presa_in_carico' }
+      },
+      {
+        url: `/v1/admin/segnalazioni/${SEGNALAZIONE_ID}/assign`,
+        method: 'POST' as const,
+        payload: { tenant_id: TENANT_B, assigned_to: USER_ID }
+      },
+      {
+        url: `/v1/admin/segnalazioni/${SEGNALAZIONE_ID}/public-response`,
+        method: 'POST' as const,
+        payload: { tenant_id: TENANT_B, message: 'Aggiornamento pubblico' }
+      },
+      {
+        url: `/v1/admin/segnalazioni/${SEGNALAZIONE_ID}/moderation-flags`,
+        method: 'POST' as const,
+        payload: { tenant_id: TENANT_B, flags: { hidden: true } }
+      }
+    ];
+
+    for (const route of routes) {
+      const rest = mockRest();
+      primeAccess(rest, 'tenant_admin', TENANT_A);
+      const app = await buildServer(rest);
+
+      const response = await app.inject({
+        method: route.method,
+        url: route.url,
+        headers: authHeaders(TENANT_A),
+        payload: route.payload
+      });
+
+      expect(response.statusCode).toBe(403);
+      await app.close();
+    }
+  });
+
+  it('denies global-admin only endpoints to tenant_admin and cittadino', async () => {
+    for (const role of ['tenant_admin', 'cittadino'] as const) {
+      const rest = mockRest();
+      primeAccess(rest, role, TENANT_A);
+      const app = await buildServer(rest);
+
+      const globalDocs = await app.inject({
+        method: 'POST',
+        url: '/v1/admin/docs/global',
+        headers: authHeaders(TENANT_A),
+        payload: { slug: 'faq', title: 'FAQ', content_md: 'contenuto di prova sufficiente', is_published: true, sort_order: 1 }
+      });
+
+      expect(globalDocs.statusCode).toBe(403);
+
+      await app.close();
+    }
+  });
+
+  it('keeps existing happy path coverage for phase4 protected endpoints', async () => {
+    const rest = mockRest();
+    primeAccess(rest, 'cittadino', TENANT_A);
     vi.mocked(rest.patch).mockResolvedValue({ data: [{ language: 'en' }] });
 
     const app = await buildServer(rest);
     const response = await app.inject({
       method: 'PUT',
       url: '/v1/me/preferences/language',
-      headers: { 'x-user-id': '1386f06c-8d0c-4a99-a157-d3576447add1', 'x-tenant-id': '1386f06c-8d0c-4a99-a157-d3576447add0' },
+      headers: authHeaders(TENANT_A),
       payload: { language: 'en' }
     });
 
@@ -32,35 +135,15 @@ describe('api server phase 4 + docs/bug flow', () => {
     await app.close();
   });
 
-  it('denies branding update to regular user', async () => {
-    const rest = mockRest();
-    vi.mocked(rest.get)
-      .mockResolvedValueOnce({ data: [{ id: 'u1', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' }] })
-      .mockResolvedValueOnce({ data: [{ roles: { code: 'cittadino' } }] });
-
-    const app = await buildServer(rest);
-    const response = await app.inject({
-      method: 'PUT',
-      url: '/v1/tenants/1386f06c-8d0c-4a99-a157-d3576447add0/branding',
-      headers: { 'x-user-id': '1386f06c-8d0c-4a99-a157-d3576447add1', 'x-tenant-id': '1386f06c-8d0c-4a99-a157-d3576447add0' },
-      payload: { primary_color: '#0055A4', secondary_color: '#FFFFFF' }
-    });
-
-    expect(response.statusCode).toBe(403);
-    await app.close();
-  });
-
   it('creates bug report and queues admin email notifications', async () => {
     const rest = mockRest();
-    vi.mocked(rest.get)
-      .mockResolvedValueOnce({ data: [{ id: 'u1', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' }] })
-      .mockResolvedValueOnce({ data: [{ roles: { code: 'cittadino' } }] })
-      .mockResolvedValueOnce({
-        data: [
-          { user_id: 'a1', roles: { code: 'super_admin' }, user_profiles: { email: 'ga@example.com', tenant_id: 'xxx' } },
-          { user_id: 'a2', roles: { code: 'tenant_admin' }, user_profiles: { email: 'ta@example.com', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' } }
-        ]
-      });
+    primeAccess(rest, 'cittadino', TENANT_A);
+    vi.mocked(rest.get).mockResolvedValueOnce({
+      data: [
+        { user_id: 'a1', roles: { code: 'super_admin' }, user_profiles: { email: 'ga@example.com', tenant_id: 'xxx' } },
+        { user_id: 'a2', roles: { code: 'tenant_admin' }, user_profiles: { email: 'ta@example.com', tenant_id: TENANT_A } }
+      ]
+    });
     vi.mocked(rest.post)
       .mockResolvedValueOnce({ data: [{ id: 'b1' }] })
       .mockResolvedValue({ data: [{ id: 'n1' }] });
@@ -69,7 +152,7 @@ describe('api server phase 4 + docs/bug flow', () => {
     const response = await app.inject({
       method: 'POST',
       url: '/v1/bug-reports',
-      headers: { 'x-user-id': '1386f06c-8d0c-4a99-a157-d3576447add1', 'x-tenant-id': '1386f06c-8d0c-4a99-a157-d3576447add0' },
+      headers: authHeaders(TENANT_A),
       payload: { title: 'Errore invio pratica', description: 'Il pulsante invia non risponde nella pagina pratiche.' }
     });
 
@@ -78,60 +161,32 @@ describe('api server phase 4 + docs/bug flow', () => {
     await app.close();
   });
 
-  it('returns public docs for authenticated user', async () => {
-    const rest = mockRest();
-    vi.mocked(rest.get)
-      .mockResolvedValueOnce({ data: [{ id: 'u1', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' }] })
-      .mockResolvedValueOnce({ data: [{ roles: { code: 'cittadino' } }] })
+  it('returns docs for authenticated user and allows global admin upsert', async () => {
+    const userRest = mockRest();
+    primeAccess(userRest, 'cittadino', TENANT_A);
+    vi.mocked(userRest.get)
       .mockResolvedValueOnce({ data: [{ slug: 'how-to', title: 'Guida' }] })
       .mockResolvedValueOnce({ data: [{ slug: 'tenant', title: 'Guida Comune' }] });
 
-    const app = await buildServer(rest);
-    const response = await app.inject({
-      method: 'GET',
-      url: '/v1/docs/public',
-      headers: { 'x-user-id': '1386f06c-8d0c-4a99-a157-d3576447add1', 'x-tenant-id': '1386f06c-8d0c-4a99-a157-d3576447add0' }
-    });
+    const userApp = await buildServer(userRest);
+    const docs = await userApp.inject({ method: 'GET', url: '/v1/docs/public', headers: authHeaders(TENANT_A) });
+    expect(docs.statusCode).toBe(200);
+    expect(docs.json().global).toHaveLength(1);
+    await userApp.close();
 
-    expect(response.statusCode).toBe(200);
-    expect(response.json().global).toHaveLength(1);
-    await app.close();
-  });
+    const adminRest = mockRest();
+    primeAccess(adminRest, 'super_admin', TENANT_A);
+    vi.mocked(adminRest.post).mockResolvedValue({ data: [{ slug: 'faq', title: 'FAQ' }] });
 
-  it('allows global admin to upsert global docs', async () => {
-    const rest = mockRest();
-    vi.mocked(rest.get)
-      .mockResolvedValueOnce({ data: [{ id: 'admin', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' }] })
-      .mockResolvedValueOnce({ data: [{ roles: { code: 'super_admin' } }] });
-    vi.mocked(rest.post).mockResolvedValue({ data: [{ slug: 'faq', title: 'FAQ' }] });
-
-    const app = await buildServer(rest);
-    const response = await app.inject({
+    const adminApp = await buildServer(adminRest);
+    const upsert = await adminApp.inject({
       method: 'POST',
       url: '/v1/admin/docs/global',
-      headers: { 'x-user-id': '1386f06c-8d0c-4a99-a157-d3576447add1', 'x-tenant-id': '1386f06c-8d0c-4a99-a157-d3576447add0' },
+      headers: authHeaders(TENANT_A),
       payload: { slug: 'faq', title: 'FAQ', content_md: 'contenuto di prova sufficiente', is_published: true, sort_order: 1 }
     });
 
-    expect(response.statusCode).toBe(201);
-    await app.close();
-  });
-
-  it('denies tenant admin on foreign tenant docs', async () => {
-    const rest = mockRest();
-    vi.mocked(rest.get)
-      .mockResolvedValueOnce({ data: [{ id: 'admin', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' }] })
-      .mockResolvedValueOnce({ data: [{ roles: { code: 'tenant_admin' } }] });
-
-    const app = await buildServer(rest);
-    const response = await app.inject({
-      method: 'POST',
-      url: '/v1/admin/docs/tenant/2386f06c-8d0c-4a99-a157-d3576447add0',
-      headers: { 'x-user-id': '1386f06c-8d0c-4a99-a157-d3576447add1', 'x-tenant-id': '1386f06c-8d0c-4a99-a157-d3576447add0' },
-      payload: { slug: 'regole', title: 'Regole', content_md: 'contenuto locale tenant valido', is_published: true, sort_order: 1 }
-    });
-
-    expect(response.statusCode).toBe(403);
-    await app.close();
+    expect(upsert.statusCode).toBe(201);
+    await adminApp.close();
   });
 });
