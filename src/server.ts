@@ -27,6 +27,20 @@ const roleAssignmentSchema = z.object({
   role_code: z.enum(['super_admin', 'tenant_admin', 'operatore', 'cittadino'])
 });
 
+const bugReportSchema = z.object({
+  title: z.string().min(3).max(180),
+  description: z.string().min(10).max(4000),
+  page_url: z.string().url().optional()
+});
+
+const docSchema = z.object({
+  slug: z.string().min(2).max(80).regex(/^[a-z0-9-]+$/),
+  title: z.string().min(3).max(180),
+  content_md: z.string().min(10),
+  is_published: z.boolean().default(true),
+  sort_order: z.number().int().min(0).max(999).default(0)
+});
+
 const segnalazioniQuerySchema = z.object({
   tenant_id: z.string().uuid(),
   category_id: z.string().uuid().optional(),
@@ -628,6 +642,185 @@ export async function buildServer(
         timeline: timeline.data ?? [],
         snapshots: snapshots.data ?? []
       };
+    } catch (error: any) {
+      return reply.code(500).send({ error: error.message });
+    }
+  });
+
+  app.post('/v1/admin/segnalazioni/:id/status-transition', async (req, reply) => {
+    const access = await requireAccess(req, reply, rest, 'tenant_admin');
+    if (!access) return;
+
+    const p = idParamSchema.safeParse(req.params);
+    if (isInvalid(reply, p)) return;
+    const body = statusTransitionSchema.safeParse(req.body);
+    if (isInvalid(reply, body)) return;
+
+    if (!access.isGlobalAdmin && access.tenantId !== body.data.tenant_id) {
+      return reply.code(403).send({ error: 'Cannot update another tenant segnalazione' });
+    }
+
+    try {
+      const segnalazione = await ensureSegnalazioneTenant(rest, p.data.id, body.data.tenant_id);
+      if (!segnalazione) return reply.code(404).send({ error: 'Segnalazione not found for tenant' });
+
+      const currentStatus = segnalazione.stato ?? 'in_attesa';
+      const allowed = allowedTransitions[currentStatus] ?? [];
+      if (!allowed.includes(body.data.status)) {
+        return reply.code(409).send({ error: `Transition ${currentStatus} -> ${body.data.status} not allowed` });
+      }
+
+      const { data } = await rest.patch('/segnalazioni', { stato: body.data.status }, {
+        params: { id: `eq.${p.data.id}`, tenant_id: `eq.${body.data.tenant_id}` },
+        headers: { Prefer: 'return=representation' }
+      });
+
+      await createAdminTrail(rest, {
+        tenantId: body.data.tenant_id,
+        segnalazioneId: p.data.id,
+        actorId: access.userId,
+        eventType: 'status_transition',
+        message: body.data.message ?? `Stato aggiornato a ${body.data.status}`,
+        payload: { from: currentStatus, to: body.data.status },
+        action: 'segnalazione_status_transition',
+        metadata: { from: currentStatus, to: body.data.status }
+      });
+
+      return { item: data?.[0] ?? { id: p.data.id, stato: body.data.status } };
+    } catch (error: any) {
+      return reply.code(500).send({ error: error.message });
+    }
+  });
+
+  app.post('/v1/admin/segnalazioni/:id/assign', async (req, reply) => {
+    const access = await requireAccess(req, reply, rest, 'tenant_admin');
+    if (!access) return;
+
+    const p = idParamSchema.safeParse(req.params);
+    if (isInvalid(reply, p)) return;
+    const body = assignSchema.safeParse(req.body);
+    if (isInvalid(reply, body)) return;
+
+    if (!access.isGlobalAdmin && access.tenantId !== body.data.tenant_id) {
+      return reply.code(403).send({ error: 'Cannot update another tenant segnalazione' });
+    }
+
+    try {
+      const segnalazione = await ensureSegnalazioneTenant(rest, p.data.id, body.data.tenant_id);
+      if (!segnalazione) return reply.code(404).send({ error: 'Segnalazione not found for tenant' });
+
+      const { data } = await rest.patch('/segnalazioni', { assigned_to: body.data.assigned_to }, {
+        params: { id: `eq.${p.data.id}`, tenant_id: `eq.${body.data.tenant_id}` },
+        headers: { Prefer: 'return=representation' }
+      });
+
+      await createAdminTrail(rest, {
+        tenantId: body.data.tenant_id,
+        segnalazioneId: p.data.id,
+        actorId: access.userId,
+        eventType: 'assigned',
+        message: body.data.message ?? 'Segnalazione assegnata ad operatore',
+        payload: { assigned_to: body.data.assigned_to },
+        action: 'segnalazione_assigned',
+        metadata: { assigned_to: body.data.assigned_to }
+      });
+
+      return { item: data?.[0] ?? { id: p.data.id, assigned_to: body.data.assigned_to } };
+    } catch (error: any) {
+      return reply.code(500).send({ error: error.message });
+    }
+  });
+
+  app.post('/v1/admin/segnalazioni/:id/public-response', async (req, reply) => {
+    const access = await requireAccess(req, reply, rest, 'tenant_admin');
+    if (!access) return;
+
+    const p = idParamSchema.safeParse(req.params);
+    if (isInvalid(reply, p)) return;
+    const body = publicResponseSchema.safeParse(req.body);
+    if (isInvalid(reply, body)) return;
+
+    if (!access.isGlobalAdmin && access.tenantId !== body.data.tenant_id) {
+      return reply.code(403).send({ error: 'Cannot update another tenant segnalazione' });
+    }
+
+    try {
+      const segnalazione = await ensureSegnalazioneTenant(rest, p.data.id, body.data.tenant_id);
+      if (!segnalazione) return reply.code(404).send({ error: 'Segnalazione not found for tenant' });
+
+      const currentMetadata = segnalazione.metadata ?? {};
+      const nextMetadata = {
+        ...currentMetadata,
+        latest_public_response: {
+          message: body.data.message,
+          actor_id: access.userId,
+          created_at: new Date().toISOString()
+        }
+      };
+
+      await rest.patch('/segnalazioni', { public_response: body.data.message, metadata: nextMetadata }, {
+        params: { id: `eq.${p.data.id}`, tenant_id: `eq.${body.data.tenant_id}` },
+        headers: { Prefer: 'return=minimal' }
+      });
+
+      await createAdminTrail(rest, {
+        tenantId: body.data.tenant_id,
+        segnalazioneId: p.data.id,
+        actorId: access.userId,
+        eventType: 'public_response',
+        message: body.data.message,
+        payload: { public: true },
+        action: 'segnalazione_public_response',
+        metadata: { message_preview: body.data.message.slice(0, 120) }
+      });
+
+      return { ok: true };
+    } catch (error: any) {
+      return reply.code(500).send({ error: error.message });
+    }
+  });
+
+  app.post('/v1/admin/segnalazioni/:id/moderation-flags', async (req, reply) => {
+    const access = await requireAccess(req, reply, rest, 'tenant_admin');
+    if (!access) return;
+
+    const p = idParamSchema.safeParse(req.params);
+    if (isInvalid(reply, p)) return;
+    const body = moderationFlagsSchema.safeParse(req.body);
+    if (isInvalid(reply, body)) return;
+
+    if (!access.isGlobalAdmin && access.tenantId !== body.data.tenant_id) {
+      return reply.code(403).send({ error: 'Cannot update another tenant segnalazione' });
+    }
+
+    try {
+      const segnalazione = await ensureSegnalazioneTenant(rest, p.data.id, body.data.tenant_id);
+      if (!segnalazione) return reply.code(404).send({ error: 'Segnalazione not found for tenant' });
+
+      const nextFlags = {
+        ...(segnalazione.moderation_flags ?? {}),
+        ...body.data.flags,
+        updated_by: access.userId,
+        updated_at: new Date().toISOString()
+      };
+
+      await rest.patch('/segnalazioni', { moderation_flags: nextFlags }, {
+        params: { id: `eq.${p.data.id}`, tenant_id: `eq.${body.data.tenant_id}` },
+        headers: { Prefer: 'return=minimal' }
+      });
+
+      await createAdminTrail(rest, {
+        tenantId: body.data.tenant_id,
+        segnalazioneId: p.data.id,
+        actorId: access.userId,
+        eventType: 'moderation_flags',
+        message: 'Flag di moderazione aggiornati',
+        payload: { flags: nextFlags },
+        action: 'segnalazione_moderation_flags',
+        metadata: { flags: nextFlags }
+      });
+
+      return { ok: true, moderation_flags: nextFlags };
     } catch (error: any) {
       return reply.code(500).send({ error: error.message });
     }

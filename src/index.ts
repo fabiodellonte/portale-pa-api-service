@@ -1,5 +1,5 @@
 import dotenv from 'dotenv';
-import { buildServer, createRestClient } from './server.js';
+import { buildServer, createAuthClient, createRestClient } from './server.js';
 
 dotenv.config();
 
@@ -8,7 +8,8 @@ const host = process.env.API_HOST ?? '0.0.0.0';
 const supabaseUrl = process.env.SUPABASE_URL ?? 'http://localhost:54321';
 
 const rest = createRestClient(supabaseUrl);
-const app = await buildServer(rest);
+const auth = createAuthClient(supabaseUrl);
+const app = await buildServer(rest, auth);
 
 app.listen({ port, host }).catch((err) => {
   app.log.error(err);

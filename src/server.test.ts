@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { buildServer, type RestClient } from './server.js';
+import { buildServer, type AuthClient, type RestClient } from './server.js';
 
 function mockRest(): RestClient {
   return {
@@ -8,6 +8,12 @@ function mockRest(): RestClient {
     delete: vi.fn(),
     patch: vi.fn()
   } as unknown as RestClient;
+}
+
+function mockAuth(): AuthClient {
+  return {
+    request: vi.fn()
+  } as unknown as AuthClient;
 }
 
 describe('api server', () => {
@@ -125,6 +131,50 @@ describe('api server', () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ total_segnalazioni: 2, total_votes: 2, total_follows: 1, by_status: { in_attesa: 1, chiusa: 1 } });
+    await app.close();
+  });
+
+  it('returns ranking transparency metadata', async () => {
+    const app = await buildServer(mockRest());
+    const response = await app.inject({ method: 'GET', url: '/v1/public/transparency/ranking' });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ algorithm: 'weighted_sum', normalized: true });
+    await app.close();
+  });
+
+  it('proxies auth calls through /v1/auth/*', async () => {
+    const rest = mockRest();
+    const auth = mockAuth();
+    vi.mocked(auth.request).mockResolvedValue({ status: 200, data: { access_token: 'x' } } as any);
+
+    const app = await buildServer(rest, auth);
+    const response = await app.inject({ method: 'POST', url: '/v1/auth/token?grant_type=password', payload: { email: 'user@test.com' } });
+
+    expect(response.statusCode).toBe(200);
+    expect(auth.request).toHaveBeenCalledWith(expect.objectContaining({ url: '/token', method: 'POST' }));
+    await app.close();
+  });
+
+  it('supports admin segnalazione status transition', async () => {
+    const rest = mockRest();
+    vi.mocked(rest.get)
+      .mockResolvedValueOnce({ data: [{ id: 'admin', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' }] })
+      .mockResolvedValueOnce({ data: [{ roles: { code: 'tenant_admin' } }] })
+      .mockResolvedValueOnce({ data: [{ id: 's1', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0', stato: 'in_attesa' }] });
+    vi.mocked(rest.patch).mockResolvedValue({ data: [{ id: 's1', stato: 'presa_in_carico' }] });
+    vi.mocked(rest.post).mockResolvedValue({ data: [] });
+
+    const app = await buildServer(rest);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/admin/segnalazioni/1386f06c-8d0c-4a99-a157-d3576447add9/status-transition',
+      headers: { 'x-user-id': '1386f06c-8d0c-4a99-a157-d3576447add1', 'x-tenant-id': '1386f06c-8d0c-4a99-a157-d3576447add0' },
+      payload: { tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0', status: 'presa_in_carico' }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(rest.patch).toHaveBeenCalled();
     await app.close();
   });
 });

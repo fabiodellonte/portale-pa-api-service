@@ -46,3 +46,61 @@ paths:
           schema: { type: string, format: uuid }
       responses:
         '200': { description: ok }
+  /v1/public/transparency/ranking:
+    get:
+      summary: Metadata pubblica formula ranking segnalazioni
+      responses:
+        '200': { description: ok }
+  /v1/admin/segnalazioni/{id}/status-transition:
+    post:
+      summary: Transizione di stato segnalazione (ruoli admin)
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { description: ok }
+        '403': { description: forbidden }
+  /v1/admin/segnalazioni/{id}/assign:
+    post:
+      summary: Assegna segnalazione a operatore (ruoli admin)
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { description: ok }
+        '403': { description: forbidden }
+  /v1/admin/segnalazioni/{id}/public-response:
+    post:
+      summary: Pubblica risposta ufficiale su segnalazione (ruoli admin)
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { description: ok }
+        '403': { description: forbidden }
+  /v1/admin/segnalazioni/{id}/moderation-flags:
+    post:
+      summary: Aggiorna flag moderazione segnalazione (ruoli admin)
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { description: ok }
+        '403': { description: forbidden }
+  /v1/auth/{proxy+}:
+    get:
+      summary: Proxy GET verso Supabase Auth locale
+      responses:
+        '200': { description: ok }
+    post:
+      summary: Proxy POST verso Supabase Auth locale
+      responses:
+        '200': { description: ok }
