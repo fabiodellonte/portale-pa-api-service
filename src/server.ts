@@ -2,7 +2,9 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import cors from '@fastify/cors';
 import axios, { type AxiosInstance, type Method } from 'axios';
 import { execFile } from 'node:child_process';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 
@@ -19,6 +21,11 @@ const tenantQuerySchema = z.object({ tenant_id: z.string().uuid().optional() });
 const accessQuerySchema = z.object({ user_id: z.string().uuid().optional(), tenant_id: z.string().uuid().optional() });
 
 const languageSchema = z.object({ language: z.enum(['it', 'en']) });
+const avatarUploadSchema = z.object({
+  filename: z.string().min(1).max(160),
+  mime_type: z.enum(['image/jpeg', 'image/png', 'image/webp']),
+  content_base64: z.string().min(16)
+});
 const brandingSchema = z.object({
   logo_url: z.string().url().optional().nullable(),
   primary_color: z.string().regex(/^#([A-Fa-f0-9]{6})$/),
@@ -253,6 +260,53 @@ function sanitizeHeaders(headers: Record<string, unknown>) {
     if (typeof value === 'string') acc[key] = value;
     return acc;
   }, {});
+}
+
+const avatarMimeExtensions: Record<'image/jpeg' | 'image/png' | 'image/webp', string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp'
+};
+
+const maxAvatarBytes = 2 * 1024 * 1024;
+
+function sanitizeFilenameBase(value: string) {
+  const cleaned = value.toLowerCase().replace(/\.[a-z0-9]+$/i, '').replace(/[^a-z0-9_-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+  return cleaned.slice(0, 48) || 'avatar';
+}
+
+function avatarUploadDir() {
+  return path.resolve(process.cwd(), process.env.AVATAR_UPLOAD_DIR ?? 'public', 'avatars');
+}
+
+function buildAvatarPublicUrl(filename: string) {
+  const base = process.env.PUBLIC_BASE_URL ?? process.env.API_PUBLIC_BASE_URL ?? '';
+  return `${base.replace(/\/$/, '')}/public/avatars/${filename}`;
+}
+
+async function storeAvatarImage(input: { tenantId: string; userId: string; filename: string; mimeType: 'image/jpeg' | 'image/png' | 'image/webp'; contentBase64: string }) {
+  const safeBase = sanitizeFilenameBase(input.filename);
+  const ext = avatarMimeExtensions[input.mimeType];
+  const finalFilename = `${input.tenantId}-${input.userId}-${safeBase}-${randomUUID()}.${ext}`;
+  const content = Buffer.from(input.contentBase64, 'base64');
+
+  if (content.length === 0) throw new Error('Avatar content is empty');
+  if (content.length > maxAvatarBytes) throw new Error('Avatar exceeds max size 2MB');
+
+  const uploadDir = avatarUploadDir();
+  await mkdir(uploadDir, { recursive: true });
+  await writeFile(path.join(uploadDir, finalFilename), content);
+
+  return {
+    avatar_url: buildAvatarPublicUrl(finalFilename),
+    avatar_meta: {
+      mime_type: input.mimeType,
+      size_bytes: content.length,
+      original_filename: input.filename,
+      stored_filename: finalFilename,
+      updated_at: new Date().toISOString()
+    }
+  };
 }
 
 function loadEmailChannelConfig(): EmailChannelConfig {
@@ -504,6 +558,25 @@ export async function buildServer(
 
   app.get('/health', async () => ({ ok: true, service: 'portale-pa-api-service' }));
 
+  app.get('/public/avatars/:file', async (req, reply) => {
+    const file = String((req.params as any)?.file ?? '');
+    if (!/^[a-zA-Z0-9._-]+$/.test(file)) {
+      return reply.code(400).send({ error: 'Invalid file name' });
+    }
+
+    const filePath = path.join(avatarUploadDir(), file);
+    try {
+      const data = await readFile(filePath);
+      const ext = path.extname(file).toLowerCase();
+      const contentType = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'image/jpeg';
+      reply.header('Content-Type', contentType);
+      reply.header('Cache-Control', 'public, max-age=86400');
+      return reply.send(data);
+    } catch {
+      return reply.code(404).send({ error: 'Avatar not found' });
+    }
+  });
+
   app.route({
     method: ['GET', 'POST'],
     url: '/v1/auth/*',
@@ -628,6 +701,58 @@ export async function buildServer(
     });
 
     return { user_id: auth.userId, language: data?.[0]?.language ?? body.data.language };
+  });
+
+  app.get('/v1/me/avatar', async (req, reply) => {
+    const access = await requireAccess(req, reply, rest, 'authenticated');
+    if (!access) return;
+
+    const { data } = await rest.get('/user_profiles', {
+      params: { select: 'id,avatar_url,avatar_meta', id: `eq.${access.userId}`, tenant_id: `eq.${access.tenantId}`, limit: '1' }
+    });
+
+    return {
+      user_id: access.userId,
+      tenant_id: access.tenantId,
+      avatar_url: data?.[0]?.avatar_url ?? null,
+      avatar_meta: data?.[0]?.avatar_meta ?? null
+    };
+  });
+
+  app.post('/v1/me/avatar', async (req, reply) => {
+    const access = await requireAccess(req, reply, rest, 'authenticated');
+    if (!access) return;
+
+    const body = avatarUploadSchema.safeParse(req.body);
+    if (isInvalid(reply, body)) return;
+
+    try {
+      const stored = await storeAvatarImage({
+        tenantId: access.tenantId,
+        userId: access.userId,
+        filename: body.data.filename,
+        mimeType: body.data.mime_type,
+        contentBase64: body.data.content_base64
+      });
+
+      const { data } = await rest.patch('/user_profiles', {
+        avatar_url: stored.avatar_url,
+        avatar_meta: stored.avatar_meta,
+        updated_at: new Date().toISOString()
+      }, {
+        params: { id: `eq.${access.userId}`, tenant_id: `eq.${access.tenantId}` },
+        headers: { Prefer: 'return=representation' }
+      });
+
+      return reply.code(201).send({
+        user_id: access.userId,
+        tenant_id: access.tenantId,
+        avatar_url: data?.[0]?.avatar_url ?? stored.avatar_url,
+        avatar_meta: data?.[0]?.avatar_meta ?? stored.avatar_meta
+      });
+    } catch (error: any) {
+      return reply.code(400).send({ error: error.message });
+    }
   });
 
   app.get('/v1/tenants/:id/branding', async (req, reply) => {

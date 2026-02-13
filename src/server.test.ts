@@ -139,6 +139,48 @@ describe('api server auth + tenant authorization guardrails', () => {
     await app.close();
   });
 
+  it('sets and gets current user avatar with auth guardrails and validation', async () => {
+    const restUnauthorized = mockRest();
+    const unauthorizedApp = await buildServer(restUnauthorized);
+    const unauthorized = await unauthorizedApp.inject({ method: 'GET', url: '/v1/me/avatar' });
+    expect(unauthorized.statusCode).toBe(401);
+    await unauthorizedApp.close();
+
+    const rest = mockRest();
+    primeAccess(rest, 'cittadino', TENANT_A);
+    const image = Buffer.from('fake-image-content').toString('base64');
+    vi.mocked(rest.patch).mockResolvedValueOnce({ data: [{ avatar_url: '/public/avatars/a.png', avatar_meta: { size_bytes: 18 } }] });
+
+    const app = await buildServer(rest);
+    const upload = await app.inject({
+      method: 'POST',
+      url: '/v1/me/avatar',
+      headers: authHeaders(TENANT_A),
+      payload: { filename: 'avatar.png', mime_type: 'image/png', content_base64: image }
+    });
+
+    expect(upload.statusCode).toBe(201);
+    expect(upload.json()).toMatchObject({ avatar_url: '/public/avatars/a.png' });
+
+    primeAccess(rest, 'cittadino', TENANT_A);
+    vi.mocked(rest.get).mockResolvedValueOnce({ data: [{ avatar_url: '/public/avatars/a.png', avatar_meta: { size_bytes: 18 } }] });
+
+    const read = await app.inject({ method: 'GET', url: '/v1/me/avatar', headers: authHeaders(TENANT_A) });
+    expect(read.statusCode).toBe(200);
+    expect(read.json()).toMatchObject({ avatar_url: '/public/avatars/a.png' });
+
+    primeAccess(rest, 'cittadino', TENANT_A);
+    const invalid = await app.inject({
+      method: 'POST',
+      url: '/v1/me/avatar',
+      headers: authHeaders(TENANT_A),
+      payload: { filename: 'avatar.gif', mime_type: 'image/gif', content_base64: image }
+    });
+    expect(invalid.statusCode).toBe(400);
+
+    await app.close();
+  });
+
   it('creates bug report and queues admin email notifications', async () => {
     const rest = mockRest();
     primeAccess(rest, 'cittadino', TENANT_A);
