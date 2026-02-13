@@ -174,6 +174,31 @@ function sanitizeHeaders(headers: Record<string, unknown>) {
   }, {});
 }
 
+function loadEmailChannelConfig(): EmailChannelConfig {
+  return {
+    provider: process.env.NOTIFICATION_EMAIL_PROVIDER ?? 'smtp',
+    from: process.env.NOTIFICATION_FROM_EMAIL ?? 'noreply@portale-pa.local'
+  };
+}
+
+async function queueAdminEmailNotification(
+  rest: RestClient,
+  recipient: EmailNotificationRecipient,
+  payload: { bugReportId: string; tenantId: string; reporterId: string; title: string; description: string; pageUrl?: string }
+) {
+  const emailConfig = loadEmailChannelConfig();
+  return rest.post('/admin_email_notifications', {
+    bug_report_id: payload.bugReportId,
+    recipient_user_id: recipient.userId,
+    recipient_email: recipient.email,
+    provider: emailConfig.provider,
+    sender_email: emailConfig.from,
+    subject: `[Portale PA] Nuovo bug report: ${payload.title}`,
+    body: `Tenant ${payload.tenantId}\nSegnalato da ${payload.reporterId}\nTitolo: ${payload.title}\nPagina: ${payload.pageUrl ?? 'n/d'}\n\n${payload.description}`,
+    delivery_status: 'queued'
+  });
+}
+
 async function createAdminTrail(rest: RestClient, input: {
   tenantId: string;
   segnalazioneId: string;
@@ -956,20 +981,21 @@ export async function buildServer(
         params: { select: 'user_id,roles(code),user_profiles(email,tenant_id)' }
       });
 
-      const recipients = (admins ?? []).filter((row: any) => {
+      const recipients: EmailNotificationRecipient[] = (admins ?? []).flatMap((row: any) => {
         const code = row.roles?.code;
         const email = row.user_profiles?.email;
         const tenantMatch = row.user_profiles?.tenant_id === access.tenantId;
-        return !!email && (code === 'super_admin' || (code === 'tenant_admin' && tenantMatch));
+        if (!email || !(code === 'super_admin' || (code === 'tenant_admin' && tenantMatch))) return [];
+        return [{ userId: row.user_id, email }];
       });
 
-      await Promise.all(recipients.map((admin: any) => rest.post('/admin_email_notifications', {
-        bug_report_id: bug.id,
-        recipient_user_id: admin.user_id,
-        recipient_email: admin.user_profiles.email,
-        subject: `[Portale PA] Nuovo bug report: ${body.data.title}`,
-        body: `Tenant ${access.tenantId}\nSegnalato da ${access.userId}\nTitolo: ${body.data.title}\n\n${body.data.description}`,
-        delivery_status: 'queued'
+      await Promise.all(recipients.map((admin) => queueAdminEmailNotification(rest, admin, {
+        bugReportId: bug.id,
+        tenantId: access.tenantId,
+        reporterId: access.userId,
+        title: body.data.title,
+        description: body.data.description,
+        pageUrl: body.data.page_url
       })));
 
       return reply.code(201).send({ id: bug.id, notified_admins: recipients.length });
