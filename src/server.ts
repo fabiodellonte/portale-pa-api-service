@@ -1,13 +1,31 @@
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
-import axios, { type AxiosInstance } from 'axios';
+import axios, { type AxiosInstance, type Method } from 'axios';
 import { z } from 'zod';
 
-export type RestClient = Pick<AxiosInstance, 'get' | 'post' | 'delete'>;
+export type RestClient = Pick<AxiosInstance, 'get' | 'post' | 'delete' | 'patch'>;
+export type AuthClient = Pick<AxiosInstance, 'request'>;
+
+type RoleCode = 'super_admin' | 'tenant_admin' | 'operatore' | 'cittadino';
 
 const tenantSchema = z.object({ name: z.string().min(2), codice_fiscale_ente: z.string().optional() });
 const idParamSchema = z.object({ id: z.string().uuid() });
 const tenantQuerySchema = z.object({ tenant_id: z.string().uuid().optional() });
+const accessQuerySchema = z.object({ user_id: z.string().uuid().optional(), tenant_id: z.string().uuid().optional() });
+
+const languageSchema = z.object({ language: z.enum(['it', 'en']) });
+const brandingSchema = z.object({
+  logo_url: z.string().url().optional().nullable(),
+  primary_color: z.string().regex(/^#([A-Fa-f0-9]{6})$/),
+  secondary_color: z.string().regex(/^#([A-Fa-f0-9]{6})$/),
+  font_family: z.string().max(120).optional().nullable(),
+  header_variant: z.enum(['standard', 'compact']).optional().nullable(),
+  footer_text: z.string().max(240).optional().nullable()
+});
+const roleAssignmentSchema = z.object({
+  tenant_id: z.string().uuid(),
+  role_code: z.enum(['super_admin', 'tenant_admin', 'operatore', 'cittadino'])
+});
 
 const segnalazioniQuerySchema = z.object({
   tenant_id: z.string().uuid(),
@@ -37,11 +55,73 @@ const wizardPayloadSchema = z.object({
   user_id: z.string().uuid().optional()
 });
 
+const adminSegnalazioneSchema = z.object({
+  tenant_id: z.string().uuid()
+});
+
+const statusTransitionSchema = adminSegnalazioneSchema.extend({
+  status: z.enum(['in_attesa', 'presa_in_carico', 'in_lavorazione', 'risolta', 'chiusa', 'respinta']),
+  message: z.string().min(3).max(500).optional()
+});
+
+const assignSchema = adminSegnalazioneSchema.extend({
+  assigned_to: z.string().uuid(),
+  message: z.string().min(3).max(500).optional()
+});
+
+const publicResponseSchema = adminSegnalazioneSchema.extend({
+  message: z.string().min(3).max(2000)
+});
+
+const moderationFlagsSchema = adminSegnalazioneSchema.extend({
+  flags: z.object({
+    hidden: z.boolean().optional(),
+    abusive: z.boolean().optional(),
+    duplicate_of: z.string().uuid().optional(),
+    requires_review: z.boolean().optional(),
+    note: z.string().max(500).optional()
+  })
+});
+
+const rankingFactors = [
+  { factor: 'votes', description: 'Supporto civico diretto', weight: 0.4 },
+  { factor: 'severity', description: 'Impatto e gravità', weight: 0.25 },
+  { factor: 'freshness', description: 'Recenza segnalazione', weight: 0.2 },
+  { factor: 'follows', description: 'Interesse continuativo', weight: 0.15 }
+] as const;
+
+const allowedTransitions: Record<string, string[]> = {
+  in_attesa: ['presa_in_carico', 'respinta'],
+  presa_in_carico: ['in_lavorazione', 'chiusa'],
+  in_lavorazione: ['risolta', 'chiusa'],
+  risolta: ['chiusa'],
+  chiusa: [],
+  respinta: []
+};
+
 type ToggleKind = 'vote' | 'follow';
+
+type AccessCtx = {
+  userId: string;
+  tenantId: string;
+  roleCodes: RoleCode[];
+  isGlobalAdmin: boolean;
+  isTenantAdmin: boolean;
+};
 
 export function createRestClient(supabaseUrl: string): RestClient {
   return axios.create({
     baseURL: `${supabaseUrl}/rest/v1`,
+    timeout: 10000,
+    headers: {
+      'Content-Type': 'application/json'
+    }
+  });
+}
+
+export function createAuthClient(supabaseUrl: string): AuthClient {
+  return axios.create({
+    baseURL: `${supabaseUrl}/auth/v1`,
     timeout: 10000,
     headers: {
       'Content-Type': 'application/json'
@@ -61,20 +141,54 @@ function codiceSegnalazione() {
   return `SGN-${Date.now()}`;
 }
 
+function sanitizeHeaders(headers: Record<string, unknown>) {
+  const denied = new Set(['host', 'connection', 'content-length']);
+  return Object.entries(headers).reduce<Record<string, string>>((acc, [key, value]) => {
+    if (denied.has(key.toLowerCase())) return acc;
+    if (typeof value === 'string') acc[key] = value;
+    return acc;
+  }, {});
+}
+
+async function createAdminTrail(rest: RestClient, input: {
+  tenantId: string;
+  segnalazioneId: string;
+  actorId: string;
+  eventType: string;
+  message: string;
+  payload?: Record<string, unknown>;
+  action: string;
+  metadata?: Record<string, unknown>;
+}) {
+  await Promise.all([
+    rest.post('/segnalazione_timeline_events', {
+      tenant_id: input.tenantId,
+      segnalazione_id: input.segnalazioneId,
+      event_type: input.eventType,
+      visibility: 'public',
+      message: input.message,
+      payload: input.payload ?? {},
+      created_by: input.actorId
+    }),
+    rest.post('/audit_log', {
+      tenant_id: input.tenantId,
+      actor_id: input.actorId,
+      action: input.action,
+      entity_type: 'segnalazioni',
+      entity_id: input.segnalazioneId,
+      metadata: input.metadata ?? {}
+    })
+  ]);
+}
+
 async function ensureSegnalazioneTenant(rest: RestClient, segnalazioneId: string, tenantId: string) {
   const { data } = await rest.get('/segnalazioni', {
-    params: { select: 'id,tenant_id', id: `eq.${segnalazioneId}`, tenant_id: `eq.${tenantId}`, limit: '1' }
+    params: { select: 'id,tenant_id,stato,metadata,moderation_flags,public_response', id: `eq.${segnalazioneId}`, tenant_id: `eq.${tenantId}`, limit: '1' }
   });
   return data?.[0];
 }
 
-async function toggleEntity(
-  rest: RestClient,
-  kind: ToggleKind,
-  tenantId: string,
-  segnalazioneId: string,
-  userId: string
-) {
+async function toggleEntity(rest: RestClient, kind: ToggleKind, tenantId: string, segnalazioneId: string, userId: string) {
   const table = kind === 'vote' ? '/segnalazione_votes' : '/segnalazione_follows';
 
   const { data: existing } = await rest.get(table, {
@@ -96,9 +210,13 @@ async function toggleEntity(
       headers: { Prefer: 'return=minimal' }
     });
   } else {
-    await rest.post(table, { tenant_id: tenantId, segnalazione_id: segnalazioneId, user_id: userId }, {
-      headers: { Prefer: 'return=representation' }
-    });
+    await rest.post(
+      table,
+      { tenant_id: tenantId, segnalazione_id: segnalazioneId, user_id: userId },
+      {
+        headers: { Prefer: 'return=representation' }
+      }
+    );
   }
 
   const { data: all } = await rest.get(table, {
@@ -108,11 +226,230 @@ async function toggleEntity(
   return { active, count: all?.length ?? 0 };
 }
 
-export async function buildServer(rest: RestClient): Promise<FastifyInstance> {
+async function loadAccess(rest: RestClient, userId: string, tenantId: string): Promise<AccessCtx> {
+  const { data: profileRows } = await rest.get('/user_profiles', {
+    params: { select: 'id,tenant_id', id: `eq.${userId}`, limit: '1' }
+  });
+  const profile = profileRows?.[0];
+  if (!profile) {
+    throw new Error('USER_NOT_FOUND');
+  }
+
+  const { data: userRoles } = await rest.get('/user_roles', {
+    params: {
+      select: 'role_id,roles(code)',
+      user_id: `eq.${userId}`
+    }
+  });
+
+  const roleCodes = (userRoles ?? [])
+    .map((r: any) => r.roles?.code)
+    .filter(Boolean) as RoleCode[];
+
+  return {
+    userId,
+    tenantId,
+    roleCodes,
+    isGlobalAdmin: roleCodes.includes('super_admin'),
+    isTenantAdmin: profile.tenant_id === tenantId && roleCodes.includes('tenant_admin')
+  };
+}
+
+function extractAuth(req: FastifyRequest) {
+  const userId = req.headers['x-user-id'];
+  const tenantId = req.headers['x-tenant-id'];
+
+  if (typeof userId !== 'string' || typeof tenantId !== 'string') {
+    return null;
+  }
+
+  const parsed = z.object({ userId: z.string().uuid(), tenantId: z.string().uuid() }).safeParse({ userId, tenantId });
+  return parsed.success ? parsed.data : null;
+}
+
+async function requireAccess(
+  req: FastifyRequest,
+  reply: FastifyReply,
+  rest: RestClient,
+  mode: 'authenticated' | 'tenant_admin' | 'global_admin'
+): Promise<AccessCtx | null> {
+  const auth = extractAuth(req);
+  if (!auth) {
+    reply.code(401).send({ error: 'Missing or invalid x-user-id/x-tenant-id headers' });
+    return null;
+  }
+
+  try {
+    const access = await loadAccess(rest, auth.userId, auth.tenantId);
+    if (mode === 'authenticated') return access;
+    if (mode === 'tenant_admin' && !(access.isGlobalAdmin || access.isTenantAdmin)) {
+      reply.code(403).send({ error: 'Insufficient role for tenant admin operation' });
+      return null;
+    }
+    if (mode === 'global_admin' && !access.isGlobalAdmin) {
+      reply.code(403).send({ error: 'Insufficient role for global admin operation' });
+      return null;
+    }
+    return access;
+  } catch (error: any) {
+    if (error.message === 'USER_NOT_FOUND') {
+      reply.code(401).send({ error: 'Unknown user profile' });
+      return null;
+    }
+    reply.code(500).send({ error: error.message });
+    return null;
+  }
+}
+
+export async function buildServer(
+  rest: RestClient,
+  auth: AuthClient = createAuthClient(process.env.SUPABASE_URL ?? 'http://localhost:54321')
+): Promise<FastifyInstance> {
   const app = Fastify({ logger: true });
   await app.register(cors, { origin: true });
 
   app.get('/health', async () => ({ ok: true, service: 'portale-pa-api-service' }));
+
+  app.route({
+    method: ['GET', 'POST'],
+    url: '/v1/auth/*',
+    handler: async (req, reply) => {
+      try {
+        const path = ((req.params as { '*': string })['*'] ?? '').trim();
+        const response = await auth.request({
+          method: req.method.toUpperCase() as Method,
+          url: `/${path}`,
+          params: req.query as Record<string, unknown>,
+          data: req.body,
+          headers: sanitizeHeaders(req.headers as Record<string, unknown>)
+        });
+        return reply.code(response.status).send(response.data);
+      } catch (error: any) {
+        const status = error?.response?.status ?? 500;
+        return reply.code(status).send(error?.response?.data ?? { error: error.message });
+      }
+    }
+  });
+
+  app.get('/v1/me/access', async (req, reply) => {
+    const auth = await requireAccess(req, reply, rest, 'authenticated');
+    if (!auth) return;
+
+    return {
+      user_id: auth.userId,
+      tenant_id: auth.tenantId,
+      roles: auth.roleCodes,
+      can_manage_branding: auth.isGlobalAdmin || auth.isTenantAdmin,
+      can_manage_roles: auth.isGlobalAdmin,
+      can_manage_language: true
+    };
+  });
+
+  app.get('/v1/me/preferences', async (req, reply) => {
+    const auth = await requireAccess(req, reply, rest, 'authenticated');
+    if (!auth) return;
+
+    const { data } = await rest.get('/user_profiles', { params: { select: 'id,language', id: `eq.${auth.userId}`, limit: '1' } });
+    return { user_id: auth.userId, language: data?.[0]?.language ?? 'it' };
+  });
+
+  app.put('/v1/me/preferences/language', async (req, reply) => {
+    const auth = await requireAccess(req, reply, rest, 'authenticated');
+    if (!auth) return;
+
+    const body = languageSchema.safeParse(req.body);
+    if (isInvalid(reply, body)) return;
+
+    const { data } = await rest.patch('/user_profiles', { language: body.data.language }, {
+      params: { id: `eq.${auth.userId}` },
+      headers: { Prefer: 'return=representation' }
+    });
+
+    return { user_id: auth.userId, language: data?.[0]?.language ?? body.data.language };
+  });
+
+  app.get('/v1/tenants/:id/branding', async (req, reply) => {
+    const auth = await requireAccess(req, reply, rest, 'authenticated');
+    if (!auth) return;
+
+    const params = idParamSchema.safeParse(req.params);
+    if (isInvalid(reply, params)) return;
+
+    if (!auth.isGlobalAdmin && auth.tenantId !== params.data.id) {
+      return reply.code(403).send({ error: 'Cannot read another tenant branding' });
+    }
+
+    const { data } = await rest.get('/tenant_branding', {
+      params: { select: '*', tenant_id: `eq.${params.data.id}`, limit: '1' }
+    });
+
+    return data?.[0] ?? { tenant_id: params.data.id, primary_color: '#0055A4', secondary_color: '#FFFFFF' };
+  });
+
+  app.put('/v1/tenants/:id/branding', async (req, reply) => {
+    const auth = await requireAccess(req, reply, rest, 'tenant_admin');
+    if (!auth) return;
+
+    const params = idParamSchema.safeParse(req.params);
+    if (isInvalid(reply, params)) return;
+    const body = brandingSchema.safeParse(req.body);
+    if (isInvalid(reply, body)) return;
+
+    if (!auth.isGlobalAdmin && auth.tenantId !== params.data.id) {
+      return reply.code(403).send({ error: 'Cannot update another tenant branding' });
+    }
+
+    const payload = { tenant_id: params.data.id, ...body.data, updated_by: auth.userId };
+    const { data } = await rest.post('/tenant_branding', payload, {
+      params: { on_conflict: 'tenant_id' },
+      headers: { Prefer: 'resolution=merge-duplicates,return=representation' }
+    });
+
+    return data?.[0] ?? payload;
+  });
+
+  app.get('/v1/admin/roles', async (req, reply) => {
+    const auth = await requireAccess(req, reply, rest, 'global_admin');
+    if (!auth) return;
+
+    const query = accessQuerySchema.safeParse(req.query);
+    if (isInvalid(reply, query)) return;
+
+    const userFilter = query.data.user_id ? { user_id: `eq.${query.data.user_id}` } : {};
+    const { data } = await rest.get('/user_roles', {
+      params: {
+        select: 'user_id,role_id,roles(code,name),user_profiles(tenant_id,full_name)',
+        ...userFilter
+      }
+    });
+
+    const rows = (data ?? []).filter((row: any) => !query.data.tenant_id || row.user_profiles?.tenant_id === query.data.tenant_id);
+    return { items: rows };
+  });
+
+  app.put('/v1/admin/roles/:id', async (req, reply) => {
+    const auth = await requireAccess(req, reply, rest, 'global_admin');
+    if (!auth) return;
+
+    const params = idParamSchema.safeParse(req.params);
+    if (isInvalid(reply, params)) return;
+    const body = roleAssignmentSchema.safeParse(req.body);
+    if (isInvalid(reply, body)) return;
+
+    const { data: profiles } = await rest.get('/user_profiles', { params: { select: 'id,tenant_id', id: `eq.${params.data.id}`, limit: '1' } });
+    if (!profiles?.[0]) return reply.code(404).send({ error: 'User profile not found' });
+    if (profiles[0].tenant_id !== body.data.tenant_id) return reply.code(400).send({ error: 'tenant_id does not match profile tenant' });
+
+    const { data: roleRows } = await rest.get('/roles', { params: { select: 'id,code', code: `eq.${body.data.role_code}`, limit: '1' } });
+    const role = roleRows?.[0];
+    if (!role) return reply.code(404).send({ error: 'Role not found' });
+
+    await rest.post('/user_roles', { user_id: params.data.id, role_id: role.id }, {
+      headers: { Prefer: 'resolution=ignore-duplicates,return=representation' }
+    });
+
+    return { user_id: params.data.id, tenant_id: body.data.tenant_id, role_code: role.code };
+  });
 
   app.get('/v1/tenants', async (_req, reply) => {
     try {
@@ -225,6 +562,17 @@ export async function buildServer(rest: RestClient): Promise<FastifyInstance> {
     }
   });
 
+  app.get('/v1/public/transparency/ranking', async () => {
+    const totalWeight = rankingFactors.reduce((acc, item) => acc + item.weight, 0);
+    return {
+      algorithm: 'weighted_sum',
+      version: '2026-02-phase3',
+      normalized: true,
+      total_weight: totalWeight,
+      factors: rankingFactors
+    };
+  });
+
   app.get('/v1/segnalazioni', async (req, reply) => {
     const q = segnalazioniQuerySchema.safeParse(req.query);
     if (isInvalid(reply, q)) return;
@@ -241,9 +589,7 @@ export async function buildServer(rest: RestClient): Promise<FastifyInstance> {
       if (q.data.category_id) params.category_id = `eq.${q.data.category_id}`;
       if (q.data.neighborhood_id) params.neighborhood_id = `eq.${q.data.neighborhood_id}`;
       if (q.data.status) params.stato = `eq.${q.data.status}`;
-      if (q.data.search) {
-        params.or = `(titolo.ilike.*${q.data.search}*,descrizione.ilike.*${q.data.search}*)`;
-      }
+      if (q.data.search) params.or = `(titolo.ilike.*${q.data.search}*,descrizione.ilike.*${q.data.search}*)`;
 
       const { data } = await rest.get('/segnalazioni', { params });
       return { items: data ?? [], page: q.data.page, page_size: q.data.page_size };
@@ -386,4 +732,3 @@ export async function buildServer(rest: RestClient): Promise<FastifyInstance> {
 
   return app;
 }
-

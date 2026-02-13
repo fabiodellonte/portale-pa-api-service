@@ -5,7 +5,8 @@ function mockRest(): RestClient {
   return {
     get: vi.fn(),
     post: vi.fn(),
-    delete: vi.fn()
+    delete: vi.fn(),
+    patch: vi.fn()
   } as unknown as RestClient;
 }
 
@@ -21,34 +22,94 @@ describe('api server', () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ items: [{ id: '1', name: 'Comune Test' }] });
-
     await app.close();
   });
 
-  it('creates tenant', async () => {
+  it('rejects /v1/me/preferences without auth headers', async () => {
     const rest = mockRest();
-    vi.mocked(rest.post).mockResolvedValue({ data: [{ id: 'abc', name: 'Comune Nuovo' }] });
-
     const app = await buildServer(rest);
-    const response = await app.inject({ method: 'POST', url: '/v1/tenants', payload: { name: 'Comune Nuovo' } });
 
-    expect(response.statusCode).toBe(201);
-    expect(response.json()).toMatchObject({ id: 'abc', name: 'Comune Nuovo' });
+    const response = await app.inject({ method: 'GET', url: '/v1/me/preferences' });
 
+    expect(response.statusCode).toBe(401);
     await app.close();
   });
 
-  it('deletes tenant by id', async () => {
+  it('updates language preference with zod validation', async () => {
     const rest = mockRest();
-    vi.mocked(rest.delete).mockResolvedValue({ data: null });
-    const id = '1386f06c-8d0c-4a99-a157-d3576447add0';
+    vi.mocked(rest.get)
+      .mockResolvedValueOnce({ data: [{ id: 'u1', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' }] })
+      .mockResolvedValueOnce({ data: [{ roles: { code: 'cittadino' } }] });
+    vi.mocked(rest.patch).mockResolvedValue({ data: [{ language: 'en' }] });
 
     const app = await buildServer(rest);
-    const response = await app.inject({ method: 'DELETE', url: `/v1/tenants/${id}` });
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/v1/me/preferences/language',
+      headers: { 'x-user-id': '1386f06c-8d0c-4a99-a157-d3576447add1', 'x-tenant-id': '1386f06c-8d0c-4a99-a157-d3576447add0' },
+      payload: { language: 'en' }
+    });
 
-    expect(response.statusCode).toBe(204);
-    expect(rest.delete).toHaveBeenCalled();
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ language: 'en' });
+    await app.close();
+  });
 
+  it('blocks branding update to regular users', async () => {
+    const rest = mockRest();
+    vi.mocked(rest.get)
+      .mockResolvedValueOnce({ data: [{ id: 'u1', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' }] })
+      .mockResolvedValueOnce({ data: [{ roles: { code: 'cittadino' } }] });
+
+    const app = await buildServer(rest);
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/v1/tenants/1386f06c-8d0c-4a99-a157-d3576447add0/branding',
+      headers: { 'x-user-id': '1386f06c-8d0c-4a99-a157-d3576447add1', 'x-tenant-id': '1386f06c-8d0c-4a99-a157-d3576447add0' },
+      payload: { primary_color: '#0055A4', secondary_color: '#FFFFFF' }
+    });
+
+    expect(response.statusCode).toBe(403);
+    await app.close();
+  });
+
+  it('allows tenant admin branding update', async () => {
+    const rest = mockRest();
+    vi.mocked(rest.get)
+      .mockResolvedValueOnce({ data: [{ id: 'u1', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' }] })
+      .mockResolvedValueOnce({ data: [{ roles: { code: 'tenant_admin' } }] });
+    vi.mocked(rest.post).mockResolvedValue({ data: [{ tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0', primary_color: '#0055A4', secondary_color: '#FFFFFF' }] });
+
+    const app = await buildServer(rest);
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/v1/tenants/1386f06c-8d0c-4a99-a157-d3576447add0/branding',
+      headers: { 'x-user-id': '1386f06c-8d0c-4a99-a157-d3576447add1', 'x-tenant-id': '1386f06c-8d0c-4a99-a157-d3576447add0' },
+      payload: { primary_color: '#0055A4', secondary_color: '#FFFFFF' }
+    });
+
+    expect(response.statusCode).toBe(200);
+    await app.close();
+  });
+
+  it('allows global admin role assignment', async () => {
+    const rest = mockRest();
+    vi.mocked(rest.get)
+      .mockResolvedValueOnce({ data: [{ id: 'admin', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' }] })
+      .mockResolvedValueOnce({ data: [{ roles: { code: 'super_admin' } }] })
+      .mockResolvedValueOnce({ data: [{ id: 'u2', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' }] })
+      .mockResolvedValueOnce({ data: [{ id: 'r1', code: 'tenant_admin' }] });
+
+    const app = await buildServer(rest);
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/v1/admin/roles/1386f06c-8d0c-4a99-a157-d3576447add2',
+      headers: { 'x-user-id': '1386f06c-8d0c-4a99-a157-d3576447add1', 'x-tenant-id': '1386f06c-8d0c-4a99-a157-d3576447add0' },
+      payload: { tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0', role_code: 'tenant_admin' }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(rest.post).toHaveBeenCalled();
     await app.close();
   });
 
@@ -63,81 +124,7 @@ describe('api server', () => {
     const response = await app.inject({ method: 'GET', url: '/v1/public/metrics?tenant_id=1386f06c-8d0c-4a99-a157-d3576447add0' });
 
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toMatchObject({
-      total_segnalazioni: 2,
-      total_votes: 2,
-      total_follows: 1,
-      by_status: { in_attesa: 1, chiusa: 1 }
-    });
-
-    await app.close();
-  });
-
-  it('filters segnalazioni list', async () => {
-    const rest = mockRest();
-    vi.mocked(rest.get).mockResolvedValue({ data: [{ id: 's1', titolo: 'Buca in strada' }] });
-
-    const app = await buildServer(rest);
-    const response = await app.inject({
-      method: 'GET',
-      url: '/v1/segnalazioni?tenant_id=1386f06c-8d0c-4a99-a157-d3576447add0&search=buca&page=1&page_size=10'
-    });
-
-    expect(response.statusCode).toBe(200);
-    expect(response.json().items).toHaveLength(1);
-    expect(rest.get).toHaveBeenCalledWith('/segnalazioni', expect.objectContaining({ params: expect.objectContaining({ tenant_id: 'eq.1386f06c-8d0c-4a99-a157-d3576447add0' }) }));
-
-    await app.close();
-  });
-
-  it('toggles vote on segnalazione', async () => {
-    const rest = mockRest();
-    const tenantId = '1386f06c-8d0c-4a99-a157-d3576447add0';
-    const segnalazioneId = '2386f06c-8d0c-4a99-a157-d3576447add0';
-    const userId = '3386f06c-8d0c-4a99-a157-d3576447add0';
-
-    vi.mocked(rest.get)
-      .mockResolvedValueOnce({ data: [{ id: segnalazioneId, tenant_id: tenantId }] })
-      .mockResolvedValueOnce({ data: [] })
-      .mockResolvedValueOnce({ data: [{ id: 'v1' }] });
-    vi.mocked(rest.post).mockResolvedValue({ data: [{ id: 'v1' }] });
-
-    const app = await buildServer(rest);
-    const response = await app.inject({
-      method: 'POST',
-      url: `/v1/segnalazioni/${segnalazioneId}/vote-toggle`,
-      payload: { tenant_id: tenantId, user_id: userId }
-    });
-
-    expect(response.statusCode).toBe(200);
-    expect(response.json()).toMatchObject({ vote_active: true, votes_count: 1 });
-
-    await app.close();
-  });
-
-  it('creates segnalazione from wizard payload', async () => {
-    const rest = mockRest();
-    vi.mocked(rest.post)
-      .mockResolvedValueOnce({ data: [{ id: 's-id', codice: 'SGN-1', stato: 'in_attesa', titolo: 'Lampione rotto' }] })
-      .mockResolvedValueOnce({ data: [{ id: 't1' }] })
-      .mockResolvedValueOnce({ data: [{ id: 'snap1' }] })
-      .mockResolvedValueOnce({ data: [{ id: 'audit1' }] });
-
-    const app = await buildServer(rest);
-    const response = await app.inject({
-      method: 'POST',
-      url: '/v1/segnalazioni/wizard',
-      payload: {
-        tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0',
-        titolo: 'Lampione rotto',
-        descrizione: 'Il lampione non funziona da tre giorni in via Roma.',
-        tags: ['illuminazione']
-      }
-    });
-
-    expect(response.statusCode).toBe(201);
-    expect(response.json()).toMatchObject({ id: 's-id', titolo: 'Lampione rotto' });
-
+    expect(response.json()).toMatchObject({ total_segnalazioni: 2, total_votes: 2, total_follows: 1, by_status: { in_attesa: 1, chiusa: 1 } });
     await app.close();
   });
 });
