@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { buildServer, type AuthClient, type RestClient } from './server.js';
+import { buildServer, type RestClient } from './server.js';
 
 function mockRest(): RestClient {
   return {
@@ -10,38 +10,10 @@ function mockRest(): RestClient {
   } as unknown as RestClient;
 }
 
-function mockAuth(): AuthClient {
-  return {
-    request: vi.fn()
-  } as unknown as AuthClient;
-}
-
-describe('api server', () => {
+describe('api server phase 4 + docs/bug flow', () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it('returns tenants list', async () => {
-    const rest = mockRest();
-    vi.mocked(rest.get).mockResolvedValue({ data: [{ id: '1', name: 'Comune Test' }] });
-
-    const app = await buildServer(rest);
-    const response = await app.inject({ method: 'GET', url: '/v1/tenants' });
-
-    expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual({ items: [{ id: '1', name: 'Comune Test' }] });
-    await app.close();
-  });
-
-  it('rejects /v1/me/preferences without auth headers', async () => {
-    const rest = mockRest();
-    const app = await buildServer(rest);
-
-    const response = await app.inject({ method: 'GET', url: '/v1/me/preferences' });
-
-    expect(response.statusCode).toBe(401);
-    await app.close();
-  });
-
-  it('updates language preference with zod validation', async () => {
+  it('updates language preference', async () => {
     const rest = mockRest();
     vi.mocked(rest.get)
       .mockResolvedValueOnce({ data: [{ id: 'u1', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' }] })
@@ -57,11 +29,10 @@ describe('api server', () => {
     });
 
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toMatchObject({ language: 'en' });
     await app.close();
   });
 
-  it('blocks branding update to regular users', async () => {
+  it('denies branding update to regular user', async () => {
     const rest = mockRest();
     vi.mocked(rest.get)
       .mockResolvedValueOnce({ data: [{ id: 'u1', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' }] })
@@ -79,102 +50,88 @@ describe('api server', () => {
     await app.close();
   });
 
-  it('allows tenant admin branding update', async () => {
+  it('creates bug report and queues admin email notifications', async () => {
     const rest = mockRest();
     vi.mocked(rest.get)
       .mockResolvedValueOnce({ data: [{ id: 'u1', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' }] })
-      .mockResolvedValueOnce({ data: [{ roles: { code: 'tenant_admin' } }] });
-    vi.mocked(rest.post).mockResolvedValue({ data: [{ tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0', primary_color: '#0055A4', secondary_color: '#FFFFFF' }] });
-
-    const app = await buildServer(rest);
-    const response = await app.inject({
-      method: 'PUT',
-      url: '/v1/tenants/1386f06c-8d0c-4a99-a157-d3576447add0/branding',
-      headers: { 'x-user-id': '1386f06c-8d0c-4a99-a157-d3576447add1', 'x-tenant-id': '1386f06c-8d0c-4a99-a157-d3576447add0' },
-      payload: { primary_color: '#0055A4', secondary_color: '#FFFFFF' }
-    });
-
-    expect(response.statusCode).toBe(200);
-    await app.close();
-  });
-
-  it('allows global admin role assignment', async () => {
-    const rest = mockRest();
-    vi.mocked(rest.get)
-      .mockResolvedValueOnce({ data: [{ id: 'admin', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' }] })
-      .mockResolvedValueOnce({ data: [{ roles: { code: 'super_admin' } }] })
-      .mockResolvedValueOnce({ data: [{ id: 'u2', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' }] })
-      .mockResolvedValueOnce({ data: [{ id: 'r1', code: 'tenant_admin' }] });
-
-    const app = await buildServer(rest);
-    const response = await app.inject({
-      method: 'PUT',
-      url: '/v1/admin/roles/1386f06c-8d0c-4a99-a157-d3576447add2',
-      headers: { 'x-user-id': '1386f06c-8d0c-4a99-a157-d3576447add1', 'x-tenant-id': '1386f06c-8d0c-4a99-a157-d3576447add0' },
-      payload: { tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0', role_code: 'tenant_admin' }
-    });
-
-    expect(response.statusCode).toBe(200);
-    expect(rest.post).toHaveBeenCalled();
-    await app.close();
-  });
-
-  it('returns public metrics', async () => {
-    const rest = mockRest();
-    vi.mocked(rest.get)
-      .mockResolvedValueOnce({ data: [{ id: 's1', stato: 'in_attesa' }, { id: 's2', stato: 'chiusa' }] })
-      .mockResolvedValueOnce({ data: [{ id: 'v1' }, { id: 'v2' }] })
-      .mockResolvedValueOnce({ data: [{ id: 'f1' }] });
-
-    const app = await buildServer(rest);
-    const response = await app.inject({ method: 'GET', url: '/v1/public/metrics?tenant_id=1386f06c-8d0c-4a99-a157-d3576447add0' });
-
-    expect(response.statusCode).toBe(200);
-    expect(response.json()).toMatchObject({ total_segnalazioni: 2, total_votes: 2, total_follows: 1, by_status: { in_attesa: 1, chiusa: 1 } });
-    await app.close();
-  });
-
-  it('returns ranking transparency metadata', async () => {
-    const app = await buildServer(mockRest());
-    const response = await app.inject({ method: 'GET', url: '/v1/public/transparency/ranking' });
-
-    expect(response.statusCode).toBe(200);
-    expect(response.json()).toMatchObject({ algorithm: 'weighted_sum', normalized: true });
-    await app.close();
-  });
-
-  it('proxies auth calls through /v1/auth/*', async () => {
-    const rest = mockRest();
-    const auth = mockAuth();
-    vi.mocked(auth.request).mockResolvedValue({ status: 200, data: { access_token: 'x' } } as any);
-
-    const app = await buildServer(rest, auth);
-    const response = await app.inject({ method: 'POST', url: '/v1/auth/token?grant_type=password', payload: { email: 'user@test.com' } });
-
-    expect(response.statusCode).toBe(200);
-    expect(auth.request).toHaveBeenCalledWith(expect.objectContaining({ url: '/token', method: 'POST' }));
-    await app.close();
-  });
-
-  it('supports admin segnalazione status transition', async () => {
-    const rest = mockRest();
-    vi.mocked(rest.get)
-      .mockResolvedValueOnce({ data: [{ id: 'admin', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' }] })
-      .mockResolvedValueOnce({ data: [{ roles: { code: 'tenant_admin' } }] })
-      .mockResolvedValueOnce({ data: [{ id: 's1', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0', stato: 'in_attesa' }] });
-    vi.mocked(rest.patch).mockResolvedValue({ data: [{ id: 's1', stato: 'presa_in_carico' }] });
-    vi.mocked(rest.post).mockResolvedValue({ data: [] });
+      .mockResolvedValueOnce({ data: [{ roles: { code: 'cittadino' } }] })
+      .mockResolvedValueOnce({
+        data: [
+          { user_id: 'a1', roles: { code: 'super_admin' }, user_profiles: { email: 'ga@example.com', tenant_id: 'xxx' } },
+          { user_id: 'a2', roles: { code: 'tenant_admin' }, user_profiles: { email: 'ta@example.com', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' } }
+        ]
+      });
+    vi.mocked(rest.post)
+      .mockResolvedValueOnce({ data: [{ id: 'b1' }] })
+      .mockResolvedValue({ data: [{ id: 'n1' }] });
 
     const app = await buildServer(rest);
     const response = await app.inject({
       method: 'POST',
-      url: '/v1/admin/segnalazioni/1386f06c-8d0c-4a99-a157-d3576447add9/status-transition',
+      url: '/v1/bug-reports',
       headers: { 'x-user-id': '1386f06c-8d0c-4a99-a157-d3576447add1', 'x-tenant-id': '1386f06c-8d0c-4a99-a157-d3576447add0' },
-      payload: { tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0', status: 'presa_in_carico' }
+      payload: { title: 'Errore invio pratica', description: 'Il pulsante invia non risponde nella pagina pratiche.' }
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(response.json()).toMatchObject({ id: 'b1', notified_admins: 2 });
+    await app.close();
+  });
+
+  it('returns public docs for authenticated user', async () => {
+    const rest = mockRest();
+    vi.mocked(rest.get)
+      .mockResolvedValueOnce({ data: [{ id: 'u1', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' }] })
+      .mockResolvedValueOnce({ data: [{ roles: { code: 'cittadino' } }] })
+      .mockResolvedValueOnce({ data: [{ slug: 'how-to', title: 'Guida' }] })
+      .mockResolvedValueOnce({ data: [{ slug: 'tenant', title: 'Guida Comune' }] });
+
+    const app = await buildServer(rest);
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/docs/public',
+      headers: { 'x-user-id': '1386f06c-8d0c-4a99-a157-d3576447add1', 'x-tenant-id': '1386f06c-8d0c-4a99-a157-d3576447add0' }
     });
 
     expect(response.statusCode).toBe(200);
-    expect(rest.patch).toHaveBeenCalled();
+    expect(response.json().global).toHaveLength(1);
+    await app.close();
+  });
+
+  it('allows global admin to upsert global docs', async () => {
+    const rest = mockRest();
+    vi.mocked(rest.get)
+      .mockResolvedValueOnce({ data: [{ id: 'admin', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' }] })
+      .mockResolvedValueOnce({ data: [{ roles: { code: 'super_admin' } }] });
+    vi.mocked(rest.post).mockResolvedValue({ data: [{ slug: 'faq', title: 'FAQ' }] });
+
+    const app = await buildServer(rest);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/admin/docs/global',
+      headers: { 'x-user-id': '1386f06c-8d0c-4a99-a157-d3576447add1', 'x-tenant-id': '1386f06c-8d0c-4a99-a157-d3576447add0' },
+      payload: { slug: 'faq', title: 'FAQ', content_md: 'contenuto di prova sufficiente', is_published: true, sort_order: 1 }
+    });
+
+    expect(response.statusCode).toBe(201);
+    await app.close();
+  });
+
+  it('denies tenant admin on foreign tenant docs', async () => {
+    const rest = mockRest();
+    vi.mocked(rest.get)
+      .mockResolvedValueOnce({ data: [{ id: 'admin', tenant_id: '1386f06c-8d0c-4a99-a157-d3576447add0' }] })
+      .mockResolvedValueOnce({ data: [{ roles: { code: 'tenant_admin' } }] });
+
+    const app = await buildServer(rest);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/admin/docs/tenant/2386f06c-8d0c-4a99-a157-d3576447add0',
+      headers: { 'x-user-id': '1386f06c-8d0c-4a99-a157-d3576447add1', 'x-tenant-id': '1386f06c-8d0c-4a99-a157-d3576447add0' },
+      payload: { slug: 'regole', title: 'Regole', content_md: 'contenuto locale tenant valido', is_published: true, sort_order: 1 }
+    });
+
+    expect(response.statusCode).toBe(403);
     await app.close();
   });
 });

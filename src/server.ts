@@ -123,6 +123,16 @@ type AccessCtx = {
   isTenantAdmin: boolean;
 };
 
+type EmailNotificationRecipient = {
+  userId: string;
+  email: string;
+};
+
+type EmailChannelConfig = {
+  provider: string;
+  from: string;
+};
+
 export function createRestClient(supabaseUrl: string): RestClient {
   return axios.create({
     baseURL: `${supabaseUrl}/rest/v1`,
@@ -921,6 +931,124 @@ export async function buildServer(
     } catch (error: any) {
       return reply.code(500).send({ error: error.message });
     }
+  });
+
+  app.post('/v1/bug-reports', async (req, reply) => {
+    const access = await requireAccess(req, reply, rest, 'authenticated');
+    if (!access) return;
+
+    const body = bugReportSchema.safeParse(req.body);
+    if (isInvalid(reply, body)) return;
+
+    try {
+      const { data: created } = await rest.post('/bug_reports', {
+        tenant_id: access.tenantId,
+        reported_by: access.userId,
+        title: body.data.title,
+        description: body.data.description,
+        page_url: body.data.page_url
+      }, { headers: { Prefer: 'return=representation' } });
+
+      const bug = created?.[0];
+      if (!bug?.id) return reply.code(500).send({ error: 'Unable to create bug report' });
+
+      const { data: admins } = await rest.get('/user_roles', {
+        params: { select: 'user_id,roles(code),user_profiles(email,tenant_id)' }
+      });
+
+      const recipients = (admins ?? []).filter((row: any) => {
+        const code = row.roles?.code;
+        const email = row.user_profiles?.email;
+        const tenantMatch = row.user_profiles?.tenant_id === access.tenantId;
+        return !!email && (code === 'super_admin' || (code === 'tenant_admin' && tenantMatch));
+      });
+
+      await Promise.all(recipients.map((admin: any) => rest.post('/admin_email_notifications', {
+        bug_report_id: bug.id,
+        recipient_user_id: admin.user_id,
+        recipient_email: admin.user_profiles.email,
+        subject: `[Portale PA] Nuovo bug report: ${body.data.title}`,
+        body: `Tenant ${access.tenantId}\nSegnalato da ${access.userId}\nTitolo: ${body.data.title}\n\n${body.data.description}`,
+        delivery_status: 'queued'
+      })));
+
+      return reply.code(201).send({ id: bug.id, notified_admins: recipients.length });
+    } catch (error: any) {
+      return reply.code(500).send({ error: error.message });
+    }
+  });
+
+  app.get('/v1/docs/public', async (req, reply) => {
+    const access = await requireAccess(req, reply, rest, 'authenticated');
+    if (!access) return;
+
+    try {
+      const [globalRes, tenantRes] = await Promise.all([
+        rest.get('/global_docs', { params: { select: 'id,slug,title,content_md,sort_order', is_published: 'eq.true', order: 'sort_order.asc' } }),
+        rest.get('/tenant_docs', { params: { select: 'id,slug,title,content_md,sort_order', tenant_id: `eq.${access.tenantId}`, is_published: 'eq.true', order: 'sort_order.asc' } })
+      ]);
+
+      return { global: globalRes.data ?? [], tenant: tenantRes.data ?? [] };
+    } catch (error: any) {
+      return reply.code(500).send({ error: error.message });
+    }
+  });
+
+  app.get('/v1/admin/docs/global', async (req, reply) => {
+    const access = await requireAccess(req, reply, rest, 'global_admin');
+    if (!access) return;
+    const { data } = await rest.get('/global_docs', { params: { select: '*', order: 'sort_order.asc' } });
+    return { items: data ?? [] };
+  });
+
+  app.post('/v1/admin/docs/global', async (req, reply) => {
+    const access = await requireAccess(req, reply, rest, 'global_admin');
+    if (!access) return;
+    const body = docSchema.safeParse(req.body);
+    if (isInvalid(reply, body)) return;
+
+    const { data } = await rest.post('/global_docs', { ...body.data, updated_by: access.userId }, {
+      params: { on_conflict: 'slug' },
+      headers: { Prefer: 'resolution=merge-duplicates,return=representation' }
+    });
+
+    return reply.code(201).send(data?.[0] ?? body.data);
+  });
+
+  app.get('/v1/admin/docs/tenant/:id', async (req, reply) => {
+    const access = await requireAccess(req, reply, rest, 'tenant_admin');
+    if (!access) return;
+
+    const params = idParamSchema.safeParse(req.params);
+    if (isInvalid(reply, params)) return;
+
+    if (!access.isGlobalAdmin && access.tenantId !== params.data.id) {
+      return reply.code(403).send({ error: 'Cannot manage another tenant documentation' });
+    }
+
+    const { data } = await rest.get('/tenant_docs', { params: { select: '*', tenant_id: `eq.${params.data.id}`, order: 'sort_order.asc' } });
+    return { items: data ?? [] };
+  });
+
+  app.post('/v1/admin/docs/tenant/:id', async (req, reply) => {
+    const access = await requireAccess(req, reply, rest, 'tenant_admin');
+    if (!access) return;
+
+    const params = idParamSchema.safeParse(req.params);
+    if (isInvalid(reply, params)) return;
+    const body = docSchema.safeParse(req.body);
+    if (isInvalid(reply, body)) return;
+
+    if (!access.isGlobalAdmin && access.tenantId !== params.data.id) {
+      return reply.code(403).send({ error: 'Cannot manage another tenant documentation' });
+    }
+
+    const { data } = await rest.post('/tenant_docs', { ...body.data, tenant_id: params.data.id, updated_by: access.userId }, {
+      params: { on_conflict: 'tenant_id,slug' },
+      headers: { Prefer: 'resolution=merge-duplicates,return=representation' }
+    });
+
+    return reply.code(201).send(data?.[0] ?? body.data);
   });
 
   return app;
