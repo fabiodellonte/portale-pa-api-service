@@ -44,8 +44,7 @@ paths:
         Sono inoltrati quasi tutti gli header originali (esclusi host/connection/content-length).
       responses:
         '200': { $ref: '#/components/responses/AnyJsonOk' }
-        '4XX': { $ref: '#/components/responses/AuthProxyError' }
-        '5XX': { $ref: '#/components/responses/AuthProxyError' }
+        default: { $ref: '#/components/responses/AuthProxyError' }
     post:
       tags: [Auth Proxy]
       summary: Proxy POST verso Supabase Auth
@@ -59,8 +58,7 @@ paths:
               additionalProperties: true
       responses:
         '200': { $ref: '#/components/responses/AnyJsonOk' }
-        '4XX': { $ref: '#/components/responses/AuthProxyError' }
-        '5XX': { $ref: '#/components/responses/AuthProxyError' }
+        default: { $ref: '#/components/responses/AuthProxyError' }
 
   /v1/me/access:
     get:
