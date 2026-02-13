@@ -374,4 +374,26 @@ describe('api server auth + tenant authorization guardrails', () => {
     }), expect.anything());
     await app.close();
   });
+
+  it('builds tenant-scoped notifications feed from timeline events', async () => {
+    const rest = mockRest();
+    vi.mocked(rest.get)
+      .mockResolvedValueOnce({
+        data: [
+          { id: 'ev-1', segnalazione_id: SEGNALAZIONE_ID, event_type: 'status_transition', message: 'Stato aggiornato', created_at: '2026-02-13T18:00:00.000Z', tenant_id: TENANT_A },
+          { id: 'ev-2', segnalazione_id: SEGNALAZIONE_ID, event_type: 'assigned', message: 'Assegnata al team', created_at: '2026-02-13T17:00:00.000Z', tenant_id: TENANT_A }
+        ]
+      })
+      .mockResolvedValueOnce({ data: [{ id: SEGNALAZIONE_ID, titolo: 'Buca via Roma', created_by: USER_ID, tenant_id: TENANT_A }] });
+
+    const app = await buildServer(rest);
+    const response = await app.inject({ method: 'GET', url: `/v1/notifications?tenant_id=${TENANT_A}&user_id=${USER_ID}` });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'status', title: expect.stringMatching(/Aggiornamento/) }),
+      expect.objectContaining({ kind: 'assignment', body: 'Assegnata al team' })
+    ]));
+    await app.close();
+  });
 });

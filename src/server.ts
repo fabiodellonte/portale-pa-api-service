@@ -68,6 +68,13 @@ const prioritiesQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(20).default(10)
 });
 
+const notificationsQuerySchema = z.object({
+  tenant_id: z.string().uuid(),
+  user_id: z.string().uuid().optional(),
+  page: z.coerce.number().int().min(1).default(1),
+  page_size: z.coerce.number().int().min(1).max(50).default(25)
+});
+
 const assistedTagsQuerySchema = z.object({
   tenant_id: z.string().uuid(),
   q: z.string().min(1).max(60).optional(),
@@ -873,6 +880,71 @@ export async function buildServer(
         .map(({ score, ...item }: any) => item);
 
       return { items };
+    } catch (error: any) {
+      return reply.code(500).send({ error: error.message });
+    }
+  });
+
+  app.get('/v1/notifications', async (req, reply) => {
+    const q = notificationsQuerySchema.safeParse(req.query);
+    if (isInvalid(reply, q)) return;
+
+    try {
+      const [timelineRes, segnalazioniRes] = await Promise.all([
+        rest.get('/segnalazione_timeline_events', {
+          params: {
+            select: 'id,segnalazione_id,event_type,message,created_at,tenant_id',
+            tenant_id: `eq.${q.data.tenant_id}`,
+            order: 'created_at.desc',
+            limit: '250'
+          }
+        }),
+        rest.get('/segnalazioni', {
+          params: {
+            select: 'id,titolo,created_by,reported_by,user_id,author_id,assigned_to,tenant_id,stato',
+            tenant_id: `eq.${q.data.tenant_id}`,
+            limit: '250'
+          }
+        })
+      ]);
+
+      const segnalazioni = (segnalazioniRes.data ?? []) as Array<Record<string, any>>;
+      const byId = segnalazioni.reduce<Record<string, Record<string, any>>>((acc, row) => {
+        if (row.id) acc[String(row.id)] = row;
+        return acc;
+      }, {});
+
+      const timelineRows = (timelineRes.data ?? []) as Array<Record<string, any>>;
+      const filtered = timelineRows.filter((row) => {
+        const segnalazione = byId[String(row.segnalazione_id ?? '')];
+        if (!segnalazione) return false;
+        if (!q.data.user_id) return true;
+        const uid = q.data.user_id;
+        return [segnalazione.created_by, segnalazione.reported_by, segnalazione.user_id, segnalazione.author_id, segnalazione.assigned_to]
+          .filter(Boolean)
+          .includes(uid);
+      });
+
+      const mapped = filtered.map((row, idx) => {
+        const segnalazione = byId[String(row.segnalazione_id)] ?? {};
+        const eventType = String(row.event_type ?? '').toLowerCase();
+        const kind = eventType.includes('assign') ? 'assignment' : eventType.includes('status') ? 'status' : 'update';
+        return {
+          id: String(row.id ?? `${row.segnalazione_id}-${idx}`),
+          kind,
+          title: kind === 'assignment'
+            ? `Assegnazione segnalazione ${segnalazione.id ?? row.segnalazione_id}`
+            : kind === 'status'
+              ? `Aggiornamento segnalazione ${segnalazione.id ?? row.segnalazione_id}`
+              : `Nuovo aggiornamento ${segnalazione.id ?? row.segnalazione_id}`,
+          body: row.message ?? segnalazione.titolo ?? 'Aggiornamento disponibile',
+          timestamp: row.created_at ?? new Date().toISOString(),
+          unread: idx < 3
+        };
+      });
+
+      const offset = (q.data.page - 1) * q.data.page_size;
+      return { items: mapped.slice(offset, offset + q.data.page_size), page: q.data.page, page_size: q.data.page_size };
     } catch (error: any) {
       return reply.code(500).send({ error: error.message });
     }
