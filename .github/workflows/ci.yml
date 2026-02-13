@@ -19,13 +19,19 @@ jobs:
           cache: npm
 
       - name: Install
-        run: npm install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
 
       - name: Build
         run: npm run build
 
       - name: Unit tests
         run: npm test
+
+      - name: Coverage gate (>=65% baseline)
+        run: npm run test:coverage
 
       - name: Email report
         if: always()

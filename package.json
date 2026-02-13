@@ -7,7 +7,9 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "test": "vitest run"
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.1",
@@ -18,8 +20,24 @@
   },
   "devDependencies": {
     "@types/node": "^22.13.1",
+    "@vitest/coverage-v8": "^3.2.4",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3",
     "vitest": "^3.0.5"
+  },
+  "vitest": {
+    "coverage": {
+      "provider": "v8",
+      "reporter": [
+        "text",
+        "lcov"
+      ],
+      "thresholds": {
+        "lines": 65,
+        "functions": 50,
+        "branches": 45,
+        "statements": 65
+      }
+    }
   }
 }
