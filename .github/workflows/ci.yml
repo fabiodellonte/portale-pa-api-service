@@ -44,9 +44,10 @@ jobs:
           import os, smtplib
           from email.message import EmailMessage
 
-          if not os.environ.get('SMTP_SERVER'):
-              print('SMTP_SERVER not configured: skipping email report')
-              raise SystemExit(0)
+          required = ['SMTP_SERVER','SMTP_PORT','SMTP_USERNAME','SMTP_PASSWORD','SMTP_FROM']
+          missing = [k for k in required if not os.environ.get(k)]
+          if missing:
+              raise RuntimeError(f"Missing SMTP secrets: {', '.join(missing)}")
 
           msg = EmailMessage()
           msg['Subject'] = f"[{os.environ['REPO']}] CI {os.environ['CI_STATUS']}"
