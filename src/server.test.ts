@@ -6,7 +6,7 @@ const TENANT_B = '2386f06c-8d0c-4a99-a157-d3576447add0';
 const USER_ID = '1386f06c-8d0c-4a99-a157-d3576447add1';
 const SEGNALAZIONE_ID = '3386f06c-8d0c-4a99-a157-d3576447add0';
 
-type RoleCode = 'super_admin' | 'tenant_admin' | 'cittadino';
+type RoleCode = 'super_admin' | 'tenant_admin' | 'operatore' | 'cittadino' | 'admin' | 'maintainer' | 'citizen';
 
 function mockRest(): RestClient {
   return {
@@ -188,5 +188,47 @@ describe('api server auth + tenant authorization guardrails', () => {
 
     expect(upsert.statusCode).toBe(201);
     await adminApp.close();
+  });
+
+  it('maps legacy roles to new portal roles on /v1/me/access', async () => {
+    const rest = mockRest();
+    primeAccess(rest, 'tenant_admin', TENANT_A);
+    const app = await buildServer(rest);
+
+    const response = await app.inject({ method: 'GET', url: '/v1/me/access', headers: authHeaders(TENANT_A) });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      portal_role: 'maintainer',
+      portal_roles: ['maintainer', 'citizen']
+    });
+    await app.close();
+  });
+
+  it('returns duplicate candidates from dedicated endpoint', async () => {
+    const rest = mockRest();
+    vi.mocked(rest.get).mockResolvedValue({ data: [{ id: 's1', titolo: 'Buca via Roma' }] });
+    const app = await buildServer(rest);
+
+    const response = await app.inject({ method: 'GET', url: `/v1/segnalazioni/duplicates?tenant_id=${TENANT_A}&titolo=Buca%20Roma` });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().items).toHaveLength(1);
+    await app.close();
+  });
+
+  it('returns computed priorities from DB-backed datasets', async () => {
+    const rest = mockRest();
+    vi.mocked(rest.get)
+      .mockResolvedValueOnce({ data: [{ id: 's1', titolo: 'Buca via Roma', priorita: 'alta', severita: 'media', category_id: 'c1', updated_at: new Date().toISOString() }] })
+      .mockResolvedValueOnce({ data: [{ segnalazione_id: 's1' }, { segnalazione_id: 's1' }] })
+      .mockResolvedValueOnce({ data: [{ id: 'c1', name: 'Viabilità' }] });
+
+    const app = await buildServer(rest);
+    const response = await app.inject({ method: 'GET', url: `/v1/segnalazioni/priorities?tenant_id=${TENANT_A}&limit=5` });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().items[0]).toMatchObject({ titolo: 'Buca via Roma', categoria: 'Viabilità', supporti: 2 });
+    await app.close();
   });
 });

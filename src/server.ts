@@ -6,7 +6,9 @@ import { z } from 'zod';
 export type RestClient = Pick<AxiosInstance, 'get' | 'post' | 'delete' | 'patch'>;
 export type AuthClient = Pick<AxiosInstance, 'request'>;
 
-type RoleCode = 'super_admin' | 'tenant_admin' | 'operatore' | 'cittadino';
+type LegacyRoleCode = 'super_admin' | 'tenant_admin' | 'operatore' | 'cittadino';
+type PortalRole = 'admin' | 'maintainer' | 'citizen';
+type RoleCode = LegacyRoleCode | PortalRole;
 
 const tenantSchema = z.object({ name: z.string().min(2), codice_fiscale_ente: z.string().optional() });
 const idParamSchema = z.object({ id: z.string().uuid() });
@@ -24,7 +26,7 @@ const brandingSchema = z.object({
 });
 const roleAssignmentSchema = z.object({
   tenant_id: z.string().uuid(),
-  role_code: z.enum(['super_admin', 'tenant_admin', 'operatore', 'cittadino'])
+  role_code: z.enum(['super_admin', 'tenant_admin', 'operatore', 'cittadino', 'admin', 'maintainer', 'citizen'])
 });
 
 const bugReportSchema = z.object({
@@ -50,6 +52,17 @@ const segnalazioniQuerySchema = z.object({
   sort: z.enum(['created_at.desc', 'created_at.asc', 'updated_at.desc', 'updated_at.asc', 'votes.desc']).optional(),
   page: z.coerce.number().int().min(1).default(1),
   page_size: z.coerce.number().int().min(1).max(100).default(20)
+});
+
+const segnalazioniDuplicatesQuerySchema = z.object({
+  tenant_id: z.string().uuid(),
+  titolo: z.string().min(3),
+  limit: z.coerce.number().int().min(1).max(20).default(5)
+});
+
+const prioritiesQuerySchema = z.object({
+  tenant_id: z.string().uuid(),
+  limit: z.coerce.number().int().min(1).max(20).default(10)
 });
 
 const toggleSchema = z.object({ tenant_id: z.string().uuid(), user_id: z.string().uuid() });
@@ -119,6 +132,8 @@ type AccessCtx = {
   userId: string;
   tenantId: string;
   roleCodes: RoleCode[];
+  portalRoles: PortalRole[];
+  portalRole: PortalRole;
   isGlobalAdmin: boolean;
   isTenantAdmin: boolean;
 };
@@ -275,6 +290,26 @@ async function toggleEntity(rest: RestClient, kind: ToggleKind, tenantId: string
   return { active, count: all?.length ?? 0 };
 }
 
+const roleCodeToPortalRole: Record<RoleCode, PortalRole> = {
+  super_admin: 'admin',
+  tenant_admin: 'maintainer',
+  operatore: 'maintainer',
+  cittadino: 'citizen',
+  admin: 'admin',
+  maintainer: 'maintainer',
+  citizen: 'citizen'
+};
+
+function resolvePortalRoles(roleCodes: RoleCode[]): PortalRole[] {
+  const normalized = Array.from(new Set(roleCodes.map((code) => roleCodeToPortalRole[code]).filter(Boolean)));
+  if (normalized.length === 0) return ['citizen'];
+  return normalized.includes('admin')
+    ? ['admin', 'maintainer', 'citizen']
+    : normalized.includes('maintainer')
+      ? ['maintainer', 'citizen']
+      : ['citizen'];
+}
+
 async function loadAccess(rest: RestClient, userId: string, tenantId: string): Promise<AccessCtx> {
   const { data: profileRows } = await rest.get('/user_profiles', {
     params: { select: 'id,tenant_id', id: `eq.${userId}`, limit: '1' }
@@ -293,14 +328,18 @@ async function loadAccess(rest: RestClient, userId: string, tenantId: string): P
 
   const roleCodes = (userRoles ?? [])
     .map((r: any) => r.roles?.code)
-    .filter(Boolean) as RoleCode[];
+    .filter((code: unknown): code is RoleCode => typeof code === 'string' && code in roleCodeToPortalRole);
+
+  const portalRoles = resolvePortalRoles(roleCodes);
 
   return {
     userId,
     tenantId,
     roleCodes,
-    isGlobalAdmin: roleCodes.includes('super_admin'),
-    isTenantAdmin: profile.tenant_id === tenantId && roleCodes.includes('tenant_admin')
+    portalRoles,
+    portalRole: portalRoles[0],
+    isGlobalAdmin: portalRoles.includes('admin'),
+    isTenantAdmin: profile.tenant_id === tenantId && (portalRoles.includes('admin') || portalRoles.includes('maintainer'))
   };
 }
 
@@ -388,6 +427,8 @@ export async function buildServer(
       user_id: auth.userId,
       tenant_id: auth.tenantId,
       roles: auth.roleCodes,
+      portal_roles: auth.portalRoles,
+      portal_role: auth.portalRole,
       can_manage_branding: auth.isGlobalAdmin || auth.isTenantAdmin,
       can_manage_roles: auth.isGlobalAdmin,
       can_manage_language: true
@@ -620,6 +661,98 @@ export async function buildServer(
       total_weight: totalWeight,
       factors: rankingFactors
     };
+  });
+
+  app.get('/v1/segnalazioni/duplicates', async (req, reply) => {
+    const q = segnalazioniDuplicatesQuerySchema.safeParse(req.query);
+    if (isInvalid(reply, q)) return;
+
+    const search = q.data.titolo.trim().split(/\s+/).slice(0, 4).join(' ');
+
+    try {
+      const { data } = await rest.get('/segnalazioni', {
+        params: {
+          select: 'id,codice,titolo,stato,updated_at',
+          tenant_id: `eq.${q.data.tenant_id}`,
+          or: `(titolo.ilike.*${search}*,descrizione.ilike.*${search}*)`,
+          order: 'updated_at.desc',
+          limit: String(q.data.limit)
+        }
+      });
+
+      return { items: data ?? [] };
+    } catch (error: any) {
+      return reply.code(500).send({ error: error.message });
+    }
+  });
+
+  app.get('/v1/segnalazioni/priorities', async (req, reply) => {
+    const q = prioritiesQuerySchema.safeParse(req.query);
+    if (isInvalid(reply, q)) return;
+
+    try {
+      const [segnalazioniRes, votesRes, categoriesRes] = await Promise.all([
+        rest.get('/segnalazioni', {
+          params: {
+            select: 'id,titolo,stato,priorita,severita,category_id,updated_at',
+            tenant_id: `eq.${q.data.tenant_id}`,
+            order: 'updated_at.desc',
+            limit: '200'
+          }
+        }),
+        rest.get('/segnalazione_votes', {
+          params: {
+            select: 'segnalazione_id',
+            tenant_id: `eq.${q.data.tenant_id}`
+          }
+        }),
+        rest.get('/segnalazione_categories', {
+          params: {
+            select: 'id,name',
+            tenant_id: `eq.${q.data.tenant_id}`
+          }
+        })
+      ]);
+
+      const votesBySegnalazione = (votesRes.data ?? []).reduce((acc: Record<string, number>, row: { segnalazione_id?: string }) => {
+        if (!row.segnalazione_id) return acc;
+        acc[row.segnalazione_id] = (acc[row.segnalazione_id] ?? 0) + 1;
+        return acc;
+      }, {});
+
+      const categoryById = (categoriesRes.data ?? []).reduce((acc: Record<string, string>, row: { id?: string; name?: string }) => {
+        if (row.id && row.name) acc[row.id] = row.name;
+        return acc;
+      }, {});
+
+      const priorityWeight: Record<string, number> = { bassa: 1, media: 2, alta: 3, urgente: 4 };
+      const severityWeight: Record<string, number> = { bassa: 1, media: 2, alta: 3, critica: 4 };
+
+      const items = (segnalazioniRes.data ?? [])
+        .map((row: any) => {
+          const supporti = votesBySegnalazione[row.id] ?? 0;
+          const updatedAt = row.updated_at ? new Date(row.updated_at).getTime() : Date.now();
+          const ageDays = Math.max(0, (Date.now() - updatedAt) / (1000 * 60 * 60 * 24));
+          const trend = ageDays <= 3 ? '+12%' : ageDays <= 7 ? '+7%' : '+3%';
+          const score = supporti * 3 + (priorityWeight[row.priorita ?? 'media'] ?? 2) * 2 + (severityWeight[row.severita ?? 'media'] ?? 2);
+
+          return {
+            id: row.id,
+            titolo: row.titolo,
+            categoria: categoryById[row.category_id] ?? 'Generale',
+            supporti,
+            trend,
+            score
+          };
+        })
+        .sort((a: any, b: any) => b.score - a.score)
+        .slice(0, q.data.limit)
+        .map(({ score, ...item }: any) => item);
+
+      return { items };
+    } catch (error: any) {
+      return reply.code(500).send({ error: error.message });
+    }
   });
 
   app.get('/v1/segnalazioni', async (req, reply) => {
