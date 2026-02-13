@@ -1,6 +1,9 @@
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
 import axios, { type AxiosInstance, type Method } from 'axios';
+import { execFile } from 'node:child_process';
+import path from 'node:path';
+import { promisify } from 'node:util';
 import { z } from 'zod';
 
 export type RestClient = Pick<AxiosInstance, 'get' | 'post' | 'delete' | 'patch'>;
@@ -148,6 +151,15 @@ type EmailChannelConfig = {
   from: string;
 };
 
+type DemoModeAction = 'status' | 'on' | 'off';
+type DemoModeState = 'on' | 'off' | 'unknown';
+type DemoModeExecutor = (action: DemoModeAction) => Promise<{ state: DemoModeState; output: string }>;
+type BuildServerOptions = {
+  demoModeExecutor?: DemoModeExecutor;
+};
+
+const execFileAsync = promisify(execFile);
+
 export function createRestClient(supabaseUrl: string): RestClient {
   return axios.create({
     baseURL: `${supabaseUrl}/rest/v1`,
@@ -194,6 +206,28 @@ function loadEmailChannelConfig(): EmailChannelConfig {
     provider: process.env.NOTIFICATION_EMAIL_PROVIDER ?? 'smtp',
     from: process.env.NOTIFICATION_FROM_EMAIL ?? 'noreply@portale-pa.local'
   };
+}
+
+function parseDemoModeState(output: string): DemoModeState {
+  const normalized = output.toLowerCase();
+  if (normalized.includes('demo mode on') || normalized.includes('modalita demo on')) return 'on';
+  if (normalized.includes('demo mode off') || normalized.includes('modalita demo off')) return 'off';
+  if (normalized.includes('no real backup recorded yet')) return 'off';
+  return 'unknown';
+}
+
+function createDemoModeExecutor(scriptPath: string): DemoModeExecutor {
+  return async (action) => {
+    const { stdout, stderr } = await execFileAsync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, '-Mode', action], {
+      windowsHide: true
+    });
+    const output = [stdout, stderr].filter(Boolean).join('\n').trim();
+    return { state: parseDemoModeState(output), output };
+  };
+}
+
+function isDemoModeSwitchEnabled() {
+  return process.env.ENABLE_DEMO_MODE_SWITCH === 'true';
 }
 
 async function queueAdminEmailNotification(
@@ -391,10 +425,15 @@ async function requireAccess(
 
 export async function buildServer(
   rest: RestClient,
-  auth: AuthClient = createAuthClient(process.env.SUPABASE_URL ?? 'http://localhost:54321')
+  auth: AuthClient = createAuthClient(process.env.SUPABASE_URL ?? 'http://localhost:54321'),
+  options: BuildServerOptions = {}
 ): Promise<FastifyInstance> {
   const app = Fastify({ logger: true });
   await app.register(cors, { origin: true });
+
+  const demoModeExecutor = options.demoModeExecutor ?? createDemoModeExecutor(
+    process.env.DEMO_MODE_SCRIPT_PATH ?? path.resolve(process.cwd(), '..', 'portale-pa-backend-supabase', 'scripts', 'demo-mode.ps1')
+  );
 
   app.get('/health', async () => ({ ok: true, service: 'portale-pa-api-service' }));
 
@@ -433,6 +472,45 @@ export async function buildServer(
       can_manage_roles: auth.isGlobalAdmin,
       can_manage_language: true
     };
+  });
+
+  app.get('/v1/admin/demo-mode', async (req, reply) => {
+    const access = await requireAccess(req, reply, rest, 'global_admin');
+    if (!access) return;
+    if (!isDemoModeSwitchEnabled()) {
+      return reply.code(404).send({ error: 'Demo mode switch disabled' });
+    }
+
+    try {
+      const result = await demoModeExecutor('status');
+      return { state: result.state, output: result.output };
+    } catch (error: any) {
+      return reply.code(500).send({ error: error.message });
+    }
+  });
+
+  app.post('/v1/admin/demo-mode', async (req, reply) => {
+    const access = await requireAccess(req, reply, rest, 'global_admin');
+    if (!access) return;
+    if (!isDemoModeSwitchEnabled()) {
+      return reply.code(404).send({ error: 'Demo mode switch disabled' });
+    }
+
+    const body = z.object({ mode: z.enum(['on', 'off']) }).safeParse(req.body);
+    if (isInvalid(reply, body)) return;
+
+    try {
+      const switched = await demoModeExecutor(body.data.mode);
+      const current = await demoModeExecutor('status');
+      return {
+        requested_mode: body.data.mode,
+        state: current.state,
+        output: switched.output,
+        status_output: current.output
+      };
+    } catch (error: any) {
+      return reply.code(500).send({ error: error.message });
+    }
   });
 
   app.get('/v1/me/preferences', async (req, reply) => {

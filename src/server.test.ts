@@ -28,7 +28,10 @@ function primeAccess(rest: RestClient, role: RoleCode, profileTenant = TENANT_A)
 }
 
 describe('api server auth + tenant authorization guardrails', () => {
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete process.env.ENABLE_DEMO_MODE_SWITCH;
+  });
 
   it('returns 401 on protected endpoints when auth headers are missing', async () => {
     const rest = mockRest();
@@ -202,6 +205,61 @@ describe('api server auth + tenant authorization guardrails', () => {
       portal_role: 'maintainer',
       portal_roles: ['maintainer', 'citizen']
     });
+    await app.close();
+  });
+
+  it('blocks demo-mode endpoints when feature flag is disabled', async () => {
+    const rest = mockRest();
+    primeAccess(rest, 'super_admin', TENANT_A);
+    const app = await buildServer(rest, undefined as any, {
+      demoModeExecutor: vi.fn().mockResolvedValue({ state: 'off', output: 'disabled' })
+    });
+
+    const response = await app.inject({ method: 'GET', url: '/v1/admin/demo-mode', headers: authHeaders(TENANT_A) });
+
+    expect(response.statusCode).toBe(404);
+    await app.close();
+  });
+
+  it('allows only global admin on demo-mode endpoints', async () => {
+    process.env.ENABLE_DEMO_MODE_SWITCH = 'true';
+
+    const rest = mockRest();
+    primeAccess(rest, 'tenant_admin', TENANT_A);
+    const app = await buildServer(rest, undefined as any, {
+      demoModeExecutor: vi.fn().mockResolvedValue({ state: 'off', output: 'ok' })
+    });
+
+    const response = await app.inject({ method: 'GET', url: '/v1/admin/demo-mode', headers: authHeaders(TENANT_A) });
+
+    expect(response.statusCode).toBe(403);
+    await app.close();
+  });
+
+  it('reads and toggles demo-mode when enabled for global admin', async () => {
+    process.env.ENABLE_DEMO_MODE_SWITCH = 'true';
+
+    const rest = mockRest();
+    primeAccess(rest, 'super_admin', TENANT_A);
+    primeAccess(rest, 'super_admin', TENANT_A);
+    const demoModeExecutor = vi.fn()
+      .mockResolvedValueOnce({ state: 'off', output: 'status off' })
+      .mockResolvedValueOnce({ state: 'on', output: 'DEMO mode ON' })
+      .mockResolvedValueOnce({ state: 'on', output: 'status on' });
+
+    const app = await buildServer(rest, undefined as any, { demoModeExecutor });
+
+    const statusResponse = await app.inject({ method: 'GET', url: '/v1/admin/demo-mode', headers: authHeaders(TENANT_A) });
+    expect(statusResponse.statusCode).toBe(200);
+    expect(statusResponse.json()).toMatchObject({ state: 'off' });
+
+    const toggleResponse = await app.inject({ method: 'POST', url: '/v1/admin/demo-mode', headers: authHeaders(TENANT_A), payload: { mode: 'on' } });
+    expect(toggleResponse.statusCode).toBe(200);
+    expect(toggleResponse.json()).toMatchObject({ requested_mode: 'on', state: 'on' });
+    expect(demoModeExecutor).toHaveBeenNthCalledWith(1, 'status');
+    expect(demoModeExecutor).toHaveBeenNthCalledWith(2, 'on');
+    expect(demoModeExecutor).toHaveBeenNthCalledWith(3, 'status');
+
     await app.close();
   });
 
