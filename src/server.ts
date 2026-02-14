@@ -1075,7 +1075,7 @@ export async function buildServer(
         }),
         rest.get('/segnalazioni', {
           params: {
-            select: 'id,titolo,created_by,reported_by,user_id,author_id,assigned_to,tenant_id,stato',
+            select: 'id,titolo,created_by,assigned_to,tenant_id,stato',
             tenant_id: `eq.${q.data.tenant_id}`,
             limit: '250'
           }
@@ -1094,7 +1094,7 @@ export async function buildServer(
         if (!segnalazione) return false;
         if (!q.data.user_id) return true;
         const uid = q.data.user_id;
-        return [segnalazione.created_by, segnalazione.reported_by, segnalazione.user_id, segnalazione.author_id, segnalazione.assigned_to]
+        return [segnalazione.created_by, segnalazione.assigned_to]
           .filter(Boolean)
           .includes(uid);
       });

@@ -484,6 +484,11 @@ describe('api server auth + tenant authorization guardrails', () => {
       expect.objectContaining({ kind: 'status', title: expect.stringMatching(/Aggiornamento/) }),
       expect.objectContaining({ kind: 'assignment', body: 'Assegnata al team' })
     ]));
+    expect(rest.get).toHaveBeenNthCalledWith(2, '/segnalazioni', expect.objectContaining({
+      params: expect.objectContaining({
+        select: 'id,titolo,created_by,assigned_to,tenant_id,stato'
+      })
+    }));
     await app.close();
   });
 });
